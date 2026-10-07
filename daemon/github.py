@@ -1,8 +1,8 @@
 """GitHub PRs for the Clawdmeter PRs screen.
 
-The badge counts open PRs waiting on the signed-in user's review. The list
-shows those first, then other unread notifications on PRs the user
-participates in (mentioned, authored, commented, assigned), up to MAX_ROWS.
+Lists open, non-draft pull requests that currently request the signed-in
+user's review (directly or via a team), most recently updated first. A PR
+drops off once the user reviews it, the request is removed, or it closes.
 Everything goes through the `gh` CLI, so it reuses whatever account
 `gh auth login` set up and never handles a token itself.
 
@@ -12,7 +12,6 @@ device reassembles.
 """
 
 import json
-import re
 import shutil
 import subprocess
 import unicodedata
@@ -21,18 +20,6 @@ from pathlib import Path
 MAX_ROWS = 12        # firmware GH_MAX_ITEMS
 PAYLOAD_LIMIT = 480  # firmware RX buffer is 512 bytes
 REF_MAX, TITLE_MAX = 36, 64
-
-REASONS = {
-    "review_requested": "Review",
-    "mention": "Mention",
-    "team_mention": "Mention",
-    "author": "Yours",
-    "comment": "Comment",
-    "assign": "Assigned",
-    "state_change": "Updated",
-    "ci_activity": "CI",
-    "approval_requested": "Approval",
-}
 
 # launchd runs the daemon with a bare PATH (/usr/bin:/bin:...), so look in
 # the usual Homebrew locations too.
@@ -67,53 +54,22 @@ def _run_gh(*args: str) -> str:
 
 
 def _review_requests() -> list[dict]:
-    """Open PRs requesting the user's (or their team's) review, newest first."""
+    """Open, ready-for-review PRs requesting the user's review, newest first."""
     out = _run_gh("search", "prs", "--review-requested=@me", "--state=open",
-                  "--sort=updated", "--json", "number,title,repository,url",
-                  "--limit", "50")
+                  "--draft=false", "--sort=updated",
+                  "--json", "number,title,repository,url,author", "--limit", "50")
     return [{
         "ref": f"{pr['repository']['name']}#{pr['number']}",
         "title": pr.get("title", ""),
-        "reason": "Review",
+        "author": (pr.get("author") or {}).get("login", ""),
         "url": pr["url"],
     } for pr in json.loads(out or "[]")]
 
 
-_API_PR = re.compile(r"^https://api\.github\.com/repos/([^/]+/[^/]+)/pulls/(\d+)$")
-
-
-def html_url(n: dict) -> str:
-    """Browser URL for a PR notification (the API gives an api.github.com URL)."""
-    m = _API_PR.match(n.get("subject", {}).get("url") or "")
-    if m:
-        return f"https://github.com/{m.group(1)}/pull/{m.group(2)}"
-    return n.get("repository", {}).get("html_url") or "https://github.com/notifications"
-
-
-def _notifications() -> list[dict]:
-    """Unread PR notifications that involve the user, newest first. Review
-    requests are left to the search above, which only sees open PRs."""
-    notifs = json.loads(_run_gh("api", "/notifications?participating=true&per_page=50") or "[]")
-    rows = []
-    for n in notifs:
-        subject = n.get("subject", {})
-        reason = n.get("reason", "")
-        if subject.get("type") != "PullRequest" or reason == "review_requested":
-            continue
-        number = (subject.get("url") or "").rsplit("/", 1)[-1]
-        repo = n.get("repository", {}).get("name", "")
-        rows.append({
-            "ref": f"{repo}#{number}" if number.isdigit() else repo,
-            "title": subject.get("title", ""),
-            "reason": REASONS.get(reason, reason.replace("_", " ").title()[:12]),
-            "url": html_url(n),
-        })
-    return rows
-
-
 def _chunks(count: int, rows: list[dict], blip: bool) -> list[dict]:
     """Split rows into {"gh":{...}} payloads that each fit one BLE write."""
-    items = [[_ascii(r["ref"], REF_MAX), _ascii(r["title"], TITLE_MAX), r["reason"]]
+    # Third field is the row's top-left label (the author here).
+    items = [[_ascii(r["ref"], REF_MAX), _ascii(r["title"], TITLE_MAX), _ascii(r["author"], 15)]
              for r in rows]
     out: list[dict] = []
     off = 0
@@ -157,8 +113,7 @@ class Watcher:
             return None
         reviews = _review_requests()
         review_urls = {r["url"] for r in reviews}
-        others = [r for r in _notifications() if r["url"] not in review_urls]
-        rows = (reviews + others)[:MAX_ROWS]
+        rows = reviews[:MAX_ROWS]
 
         new = review_urls - self.seen_reviews if self.seen_reviews is not None else set()
         self.seen_reviews = (self.seen_reviews or set()) | review_urls

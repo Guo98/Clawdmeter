@@ -46,7 +46,7 @@ struct CodexUsage {
 struct GithubItem {
     char ref[40];            // "repo#123"
     char title[72];
-    char reason[16];         // "Review", "Mention", ...
+    char reason[16];         // top-left label: the PR author
 };
 
 struct GithubNotifs {

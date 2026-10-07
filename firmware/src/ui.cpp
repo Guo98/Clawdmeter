@@ -609,7 +609,7 @@ static void set_codex_panel(lv_obj_t* pct, lv_obj_t* bar, lv_obj_t* reset,
     lv_label_set_text(reset, buf);
 }
 
-// ---- GitHub screen: newest unread PR notifications that involve the user ----
+// ---- GitHub screen: open PRs awaiting the user's review ----
 static lv_obj_t* github_container;
 static lv_obj_t* lbl_github_title;
 static lv_obj_t* lbl_github_count;   // pill beside the title
@@ -699,7 +699,7 @@ static void init_github_screen(lv_obj_t* scr) {
     }
 
     lbl_github_empty = lv_label_create(github_container);
-    lv_label_set_text(lbl_github_empty, "No PR notifications");
+    lv_label_set_text(lbl_github_empty, "No reviews waiting");
     lv_obj_set_style_text_font(lbl_github_empty, L.bt_device_font, 0);
     lv_obj_set_style_text_color(lbl_github_empty, COL_DIM, 0);
     lv_obj_align(lbl_github_empty, LV_ALIGN_CENTER, 0, 0);
@@ -1484,9 +1484,7 @@ void ui_update_github(const GithubNotifs* gh) {
         }
         const GithubItem& it = gh->items[i];
         lv_label_set_text(gh_reason[i], it.reason);
-        // Things waiting on the user stand out; FYI-type reasons stay dim.
-        bool action = strcmp(it.reason, "Review") == 0 || strcmp(it.reason, "Mention") == 0;
-        lv_obj_set_style_text_color(gh_reason[i], action ? COL_ACCENT : COL_DIM, 0);
+        lv_obj_set_style_text_color(gh_reason[i], COL_ACCENT, 0);   // PR author
         lv_label_set_text(gh_ref[i], it.ref);
         lv_label_set_text(gh_title[i], it.title);
         lv_obj_clear_flag(gh_row[i], LV_OBJ_FLAG_HIDDEN);
