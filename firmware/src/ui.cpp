@@ -601,6 +601,80 @@ static void set_codex_panel(lv_obj_t* pct, lv_obj_t* bar, lv_obj_t* reset,
     lv_label_set_text(reset, buf);
 }
 
+// ---- GitHub screen: newest unread PR notifications that involve the user ----
+static lv_obj_t* github_container;
+static lv_obj_t* lbl_github_title;
+static lv_obj_t* lbl_github_count;   // pill beside the title
+static lv_obj_t* lbl_github_empty;
+static lv_obj_t* gh_row[GH_MAX_ITEMS];
+static lv_obj_t* gh_reason[GH_MAX_ITEMS];
+static lv_obj_t* gh_ref[GH_MAX_ITEMS];
+static lv_obj_t* gh_title[GH_MAX_ITEMS];
+
+static void init_github_screen(lv_obj_t* scr) {
+    github_container = lv_obj_create(scr);
+    lv_obj_set_size(github_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(github_container, 0, 0);
+    lv_obj_set_style_bg_opa(github_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(github_container, 0, 0);
+    lv_obj_set_style_pad_all(github_container, 0, 0);
+    lv_obj_clear_flag(github_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(github_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lbl_github_title = lv_label_create(github_container);
+    lv_label_set_text(lbl_github_title, "PRs");
+    lv_obj_set_style_text_font(lbl_github_title, L.title_font, 0);
+    lv_obj_set_style_text_color(lbl_github_title, COL_TEXT, 0);
+    lv_obj_align(lbl_github_title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+
+    lbl_github_count = make_pill(github_container, "");
+    lv_obj_set_style_bg_color(lbl_github_count, COL_ACCENT, 0);
+    lv_obj_add_flag(lbl_github_count, LV_OBJ_FLAG_HIDDEN);
+
+    // One panel per notification: reason + repo#num on top, PR title below.
+    const lv_font_t* meta_font  = L.bt_credit_2_font;   // 20 / 14 / 12
+    const lv_font_t* title_font = L.bt_credit_1_font;   // 24 / 16 / 12
+    const int32_t meta_h = lv_font_get_line_height(meta_font);
+    const int32_t row_h = 2 * L.panel_pad_y + meta_h + 4 + lv_font_get_line_height(title_font);
+    const int32_t gap = L.usage_panel_gap / 2;
+    const int32_t inner_w = L.content_w - 2 * L.panel_pad_x;
+    for (int i = 0; i < GH_MAX_ITEMS; i++) {
+        gh_row[i] = make_panel(github_container, L.margin, L.content_y + i * (row_h + gap),
+                               L.content_w, row_h);
+
+        gh_reason[i] = lv_label_create(gh_row[i]);
+        lv_obj_set_style_text_font(gh_reason[i], meta_font, 0);
+        lv_obj_set_pos(gh_reason[i], 0, 0);
+
+        gh_ref[i] = lv_label_create(gh_row[i]);
+        lv_obj_set_style_text_font(gh_ref[i], meta_font, 0);
+        lv_obj_set_style_text_color(gh_ref[i], COL_DIM, 0);
+        lv_obj_set_width(gh_ref[i], inner_w * 6 / 10);
+        lv_label_set_long_mode(gh_ref[i], LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_style_text_align(gh_ref[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_height(gh_ref[i], meta_h);
+        lv_obj_align(gh_ref[i], LV_ALIGN_TOP_RIGHT, 0, 0);
+
+        gh_title[i] = lv_label_create(gh_row[i]);
+        lv_obj_set_style_text_font(gh_title[i], title_font, 0);
+        lv_obj_set_style_text_color(gh_title[i], COL_TEXT, 0);
+        lv_obj_set_width(gh_title[i], inner_w);
+        lv_obj_set_height(gh_title[i], lv_font_get_line_height(title_font));
+        lv_label_set_long_mode(gh_title[i], LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_pos(gh_title[i], 0, meta_h + 4);
+
+        lv_obj_add_flag(gh_row[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lbl_github_empty = lv_label_create(github_container);
+    lv_label_set_text(lbl_github_empty, "No PR notifications");
+    lv_obj_set_style_text_font(lbl_github_empty, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl_github_empty, COL_DIM, 0);
+    lv_obj_align(lbl_github_empty, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_add_flag(github_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ---- Media screen: previous / play-pause / next as BLE HID media keys ----
 static lv_obj_t* media_container;
 static lv_obj_t* media_art_box;     // rounded placeholder; clips the cover
@@ -814,6 +888,7 @@ void ui_init(void) {
 
     init_usage_screen(scr);
     init_codex_screen(scr);
+    init_github_screen(scr);
     init_media_screen(scr);
     splash_init(scr);
 
@@ -1021,7 +1096,7 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Tapping empty space cycles splash → usage → codex → media → splash.
+// Tapping empty space cycles splash → usage → codex → github → media → splash.
 static void global_click_cb(lv_event_t* e) {
     (void)e;
     ui_show_screen((screen_t)((current_screen + 1) % SCREEN_COUNT));
@@ -1030,6 +1105,7 @@ static void global_click_cb(lv_event_t* e) {
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(github_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(media_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
@@ -1037,6 +1113,7 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_SPLASH:  splash_show(); break;
     case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_CODEX:   lv_obj_clear_flag(codex_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_GITHUB:  lv_obj_clear_flag(github_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_MEDIA:   lv_obj_clear_flag(media_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
@@ -1127,4 +1204,42 @@ void ui_update_codex(const CodexUsage* cx) {
                     cx->session_pct, cx->session_reset_mins);
     set_codex_panel(lbl_cx_weekly_pct, bar_cx_weekly, lbl_cx_weekly_reset,
                     cx->weekly_pct, cx->weekly_reset_mins);
+}
+
+// ---- GitHub screen API ----
+
+void ui_update_github(const GithubNotifs* gh) {
+    // Count pill beside the title; the pair is centered where the title alone
+    // sits, so it clears the corner mascot and battery icon.
+    if (gh->total > 0) {
+        if (gh->total > 99) lv_label_set_text(lbl_github_count, "99+");
+        else                lv_label_set_text_fmt(lbl_github_count, "%d", gh->total);
+        lv_obj_clear_flag(lbl_github_count, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_update_layout(github_container);
+        const int32_t gap = L.title_nudge / 2 + 4;
+        const int32_t w = lv_obj_get_width(lbl_github_title) + gap + lv_obj_get_width(lbl_github_count);
+        lv_obj_align(lbl_github_title, LV_ALIGN_TOP_MID,
+                     L.title_nudge - (w - lv_obj_get_width(lbl_github_title)) / 2, L.title_y);
+        lv_obj_align_to(lbl_github_count, lbl_github_title, LV_ALIGN_OUT_RIGHT_MID, gap, 0);
+    } else {
+        lv_obj_add_flag(lbl_github_count, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(lbl_github_title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+    }
+
+    for (int i = 0; i < GH_MAX_ITEMS; i++) {
+        if (i >= gh->count) {
+            lv_obj_add_flag(gh_row[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        const GithubItem& it = gh->items[i];
+        lv_label_set_text(gh_reason[i], it.reason);
+        // Things waiting on the user stand out; FYI-type reasons stay dim.
+        bool action = strcmp(it.reason, "Review") == 0 || strcmp(it.reason, "Mention") == 0;
+        lv_obj_set_style_text_color(gh_reason[i], action ? COL_ACCENT : COL_DIM, 0);
+        lv_label_set_text(gh_ref[i], it.ref);
+        lv_label_set_text(gh_title[i], it.title);
+        lv_obj_clear_flag(gh_row[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (gh->count > 0) lv_obj_add_flag(lbl_github_empty, LV_OBJ_FLAG_HIDDEN);
+    else               lv_obj_clear_flag(lbl_github_empty, LV_OBJ_FLAG_HIDDEN);
 }

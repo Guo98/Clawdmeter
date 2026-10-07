@@ -24,6 +24,7 @@
 static UsageData usage = {};
 static NowPlaying now_playing = {};
 static CodexUsage codex = {};
+static GithubNotifs github = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -100,14 +101,15 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 }
 
 // Parse a JSON line into UsageData.
-enum payload_t { PAYLOAD_BAD, PAYLOAD_USAGE, PAYLOAD_NOW_PLAYING, PAYLOAD_CODEX };
+enum payload_t { PAYLOAD_BAD, PAYLOAD_USAGE, PAYLOAD_NOW_PLAYING, PAYLOAD_CODEX, PAYLOAD_GITHUB };
 
 // Daemon payloads share the RX characteristic: usage beats are flat objects,
-// now-playing and Codex updates arrive wrapped as {"np":{...}} / {"cx":{...}}
+// now-playing, Codex and GitHub updates arrive wrapped as {"np":{...}},
+// {"cx":{...}} or {"gh":{...}}
 // and must not be read as usage (a missing "ok" would flip the usage view to
 // "No data").
 static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np,
-                            CodexUsage* cx) {
+                            CodexUsage* cx, GithubNotifs* gh) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -130,6 +132,20 @@ static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np,
         cx->weekly_pct = cxj["w"] | 0.0f;
         cx->weekly_reset_mins = cxj["wr"] | -1;
         return PAYLOAD_CODEX;
+    }
+
+    JsonObjectConst ghj = doc["gh"];
+    if (!ghj.isNull()) {
+        gh->total = ghj["n"] | 0;
+        gh->count = 0;
+        for (JsonArrayConst it : ghj["i"].as<JsonArrayConst>()) {
+            if (gh->count >= GH_MAX_ITEMS) break;
+            GithubItem& g = gh->items[gh->count++];
+            strlcpy(g.ref, it[0] | "", sizeof(g.ref));
+            strlcpy(g.title, it[1] | "", sizeof(g.title));
+            strlcpy(g.reason, it[2] | "", sizeof(g.reason));
+        }
+        return PAYLOAD_GITHUB;
     }
 
     out->session_pct = doc["s"] | 0.0f;
@@ -399,12 +415,15 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        payload_t kind = parse_json(ble_get_data(), &usage, &now_playing, &codex);
+        payload_t kind = parse_json(ble_get_data(), &usage, &now_playing, &codex, &github);
         if (kind == PAYLOAD_NOW_PLAYING) {
             ui_update_now_playing(&now_playing);
             ble_send_ack();
         } else if (kind == PAYLOAD_CODEX) {
             ui_update_codex(&codex);
+            ble_send_ack();
+        } else if (kind == PAYLOAD_GITHUB) {
+            ui_update_github(&github);
             ble_send_ack();
         } else if (kind == PAYLOAD_USAGE) {
             int g_before = usage_rate_group();

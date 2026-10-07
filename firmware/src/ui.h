@@ -6,6 +6,7 @@ enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
     SCREEN_CODEX,
+    SCREEN_GITHUB,
     SCREEN_MEDIA,
     SCREEN_COUNT,
 };
@@ -26,3 +27,6 @@ void ui_set_media_art(const uint8_t* rgb565);  // px×px RGB565 LE, must stay va
 
 // Codex screen
 void ui_update_codex(const CodexUsage* cx);
+
+// GitHub screen
+void ui_update_github(const GithubNotifs* gh);

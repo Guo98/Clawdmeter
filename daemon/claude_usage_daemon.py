@@ -27,9 +27,10 @@ from bleak.exc import BleakError
 
 try:  # run as a script (launchd) vs imported as daemon.* (tests)
     import codex
+    import github
     import spotify
 except ImportError:
-    from daemon import codex, spotify
+    from daemon import codex, github, spotify
 
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
@@ -40,6 +41,7 @@ ART_CHAR_UUID = "4c41555a-4465-7669-6365-000000000005"
 POLL_INTERVAL = 60
 TICK = 5
 NOW_PLAYING_TICK = 3   # Spotify poll cadence while connected (if signed in)
+GITHUB_POLL = 120      # GitHub notifications poll cadence (if gh is installed)
 CONNECT_TIMEOUT = 20.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -847,6 +849,8 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
     last_poll = 0.0
     last_codex: dict | None = None
+    last_github: dict | None = None
+    last_github_poll = 0.0
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
@@ -889,6 +893,17 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
             if media:
                 await media.tick()
+
+            if github.is_available() and time.time() - last_github_poll >= GITHUB_POLL:
+                last_github_poll = time.time()
+                try:
+                    gh = await asyncio.to_thread(github.payload)
+                except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as e:
+                    log(f"GitHub poll failed: {e}")
+                    gh = None
+                if gh is not None and gh != last_github:
+                    if await session.write_payload(gh):
+                        last_github = gh
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=tick)

@@ -94,7 +94,7 @@ firmware/src/
     sim/                    — native desktop simulator: SDL2 + Arduino shims + scenario playback
     template/               — copy this to bootstrap a new port
   main.cpp                  — setup() + loop(): HAL calls only, zero #ifdef BOARD_*
-  ui.{h,cpp}                — 4-screen UI (splash, usage, codex, media); tapping empty space cycles them. compute_layout() picks fonts/positions from board_caps() (responsive — current breakpoint: H >= 460 → large, else compact)
+  ui.{h,cpp}                — 5-screen UI (splash, usage, codex, github/PRs, media); tapping empty space cycles them. compute_layout() picks fonts/positions from board_caps() (responsive — current breakpoint: H >= 460 → large, else compact)
   splash.{h,cpp}            — 20×20 pixel-art engine. CELL = min(W,H)/20, centered.
   ble.{h,cpp}               — NimBLE peripheral: custom data service + HID keyboard
   data.h                    — UsageData struct

@@ -38,3 +38,18 @@ struct CodexUsage {
     float weekly_pct;        // 7-day window, 0-100
     int   weekly_reset_mins;
 };
+
+// GitHub PR notifications pushed by the daemon as
+// {"gh":{"n":total,"i":[[ref, title, reason], ...]}} — newest first.
+#define GH_MAX_ITEMS 4
+struct GithubItem {
+    char ref[40];            // "repo#123"
+    char title[72];
+    char reason[16];         // "Review", "Mention", ...
+};
+
+struct GithubNotifs {
+    int total;               // unread PR notifications (may exceed count)
+    int count;               // items[] filled, <= GH_MAX_ITEMS
+    GithubItem items[GH_MAX_ITEMS];
+};
