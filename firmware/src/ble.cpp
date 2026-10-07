@@ -107,8 +107,16 @@ static const uint16_t DESIRED_TIMEOUT   = 600;   // ×10ms = 6s, matches PPCP
 static volatile uint16_t param_fix_handle = CONN_HANDLE_NONE;  // pending retry
 static volatile uint32_t param_fix_at_ms  = 0;                 // when to send it
 static volatile uint16_t param_fix_spent  = CONN_HANDLE_NONE;  // one per connection
-static char rx_buf[BLE_BUF_SIZE];
-static volatile bool data_ready = false;
+// Daemon payloads (usage, Codex, now-playing, GitHub) can land back-to-back
+// within milliseconds, faster than the loop task drains them, so RX keeps a
+// small FIFO instead of one buffer — a single slot let a Codex payload
+// overwrite the usage beat sent just before it. Written by the NimBLE host
+// task, drained by the loop task; rx_lock guards the indices and copies.
+#define RX_QUEUE_LEN 6
+static char rx_queue[RX_QUEUE_LEN][BLE_BUF_SIZE];
+static uint8_t rx_head = 0, rx_count = 0;
+static char rx_buf[BLE_BUF_SIZE];   // the payload handed to the loop task
+static portMUX_TYPE rx_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool has_received_data = false;
 static char mac_str[18];
 
@@ -319,9 +327,16 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
         if (!owner_write_allowed(info, "RX")) return;
         std::string val = chr->getValue();
         size_t len = std::min(val.length(), (size_t)(BLE_BUF_SIZE - 1));
-        memcpy(rx_buf, val.c_str(), len);
-        rx_buf[len] = '\0';
-        data_ready = true;
+        portENTER_CRITICAL(&rx_lock);
+        if (rx_count == RX_QUEUE_LEN) {   // full: drop the oldest
+            rx_head = (rx_head + 1) % RX_QUEUE_LEN;
+            rx_count--;
+        }
+        char* slot = rx_queue[(rx_head + rx_count) % RX_QUEUE_LEN];
+        memcpy(slot, val.c_str(), len);
+        slot[len] = '\0';
+        rx_count++;
+        portEXIT_CRITICAL(&rx_lock);
         has_received_data = true;
     }
 };
@@ -495,11 +510,20 @@ bool ble_has_bonds(void) {
 }
 
 bool ble_has_data(void) {
-    return data_ready;
+    return rx_count > 0;
 }
 
+// Pops the oldest queued payload; valid until the next call.
 const char* ble_get_data(void) {
-    data_ready = false;
+    portENTER_CRITICAL(&rx_lock);
+    if (rx_count == 0) {
+        rx_buf[0] = '\0';
+    } else {
+        memcpy(rx_buf, rx_queue[rx_head], BLE_BUF_SIZE);
+        rx_head = (rx_head + 1) % RX_QUEUE_LEN;
+        rx_count--;
+    }
+    portEXIT_CRITICAL(&rx_lock);
     return rx_buf;
 }
 
