@@ -26,9 +26,10 @@ from bleak import BleakClient
 from bleak.exc import BleakError
 
 try:  # run as a script (launchd) vs imported as daemon.* (tests)
+    import codex
     import spotify
 except ImportError:
-    from daemon import spotify
+    from daemon import codex, spotify
 
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
@@ -845,6 +846,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     tick = NOW_PLAYING_TICK if media else TICK
 
     last_poll = 0.0
+    last_codex: dict | None = None
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
@@ -864,6 +866,12 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                     if await session.write_payload(payload):
                         last_poll = time.time()
                         used_successfully = True
+                # Codex limits ride the same cadence; local file read only, and
+                # only re-sent when a value (incl. the reset countdown) changes.
+                cx = codex.payload()
+                if cx is not None and cx != last_codex:
+                    if await session.write_payload(cx):
+                        last_codex = cx
                 elif dead:
                     # No live token in any config dir (missing, or a 401/expired
                     # token) -> show "No data" now instead of stale numbers. Guard

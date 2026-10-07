@@ -30,3 +30,11 @@ struct NowPlaying {
     char title[96];
     char artist[64];
 };
+
+// Codex (OpenAI) plan limits pushed by the daemon as {"cx":{"s","sr","w","wr"}}.
+struct CodexUsage {
+    float session_pct;       // 5-hour window, 0-100
+    int   session_reset_mins;  // -1 = unknown (window lapsed since last Codex use)
+    float weekly_pct;        // 7-day window, 0-100
+    int   weekly_reset_mins;
+};

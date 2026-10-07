@@ -14,7 +14,9 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
 ## Screens
 
-The device boots into the splash. Tap empty space on the screen to cycle splash → Usage → Media → splash.
+The device boots into the splash. Tap empty space on the screen to cycle splash → Usage → Codex → Media → splash.
+
+The **Codex** screen shows your OpenAI Codex 5-hour and weekly limits. The daemon reads them from Codex CLI's local session logs (`~/.codex/sessions`), so no setup is needed — but the numbers only update when Codex is used on that machine.
 
 The **Media** screen has previous / play-pause / next buttons, sent to the host as standard Bluetooth media keys, so they control whatever is playing on the Mac (Spotify desktop, the Spotify web player, Music, YouTube…). On macOS it can also show the current Spotify track, artist, and album art — see [Spotify now playing](#spotify-now-playing-macos).
 

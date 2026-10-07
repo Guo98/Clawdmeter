@@ -94,7 +94,7 @@ firmware/src/
     sim/                    — native desktop simulator: SDL2 + Arduino shims + scenario playback
     template/               — copy this to bootstrap a new port
   main.cpp                  — setup() + loop(): HAL calls only, zero #ifdef BOARD_*
-  ui.{h,cpp}                — 3-screen UI (splash, usage, media); tapping empty space cycles them. compute_layout() picks fonts/positions from board_caps() (responsive — current breakpoint: H >= 460 → large, else compact)
+  ui.{h,cpp}                — 4-screen UI (splash, usage, codex, media); tapping empty space cycles them. compute_layout() picks fonts/positions from board_caps() (responsive — current breakpoint: H >= 460 → large, else compact)
   splash.{h,cpp}            — 20×20 pixel-art engine. CELL = min(W,H)/20, centered.
   ble.{h,cpp}               — NimBLE peripheral: custom data service + HID keyboard
   data.h                    — UsageData struct
@@ -264,4 +264,4 @@ Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic
 - `...0004` REQ — firmware fires `0x01` notify in `onSubscribe` if `has_received_data` is false. Daemon subscribes via `setsid bash -c "stdbuf -oL dbus-monitor … | awk …"`; awk drops a flag file the inner loop picks up. See the `feedback_dbus_monitor_pipe` memory for the three subtle gotchas (pipe buffering, busctl-exits race, `wait` blocking on pipeline jobs).
 - `...0005` ART — read: u16 LE cover edge in px (0 = no art, e.g. C6/no PSRAM). Write-without-response chunks `[id u8][offset u32 LE][RGB565 LE bytes]`; a new id restarts the transfer. Fed by `daemon/spotify.py` via `MediaRelay` (macOS daemon only).
 
-Now-playing text shares RX as `{"np":{"s":0|1|2,"t":title,"a":artist}}` (off/paused/playing); `parse_json` routes it away from the usage path. The HID map has a second collection (Consumer Control, report ID 2) for the Media screen's play/next/prev — changing the HID map or GATT layout requires the host to forget and re-pair.
+Codex limits share RX as `{"cx":{"s","sr","w","wr"}}` (same fields as usage), read by `daemon/codex.py` from the newest `token_count` event in `~/.codex/sessions/**/rollout-*.jsonl` and sent on the usage poll cadence when changed.  `{"np":{"s":0|1|2,"t":title,"a":artist}}` (off/paused/playing); `parse_json` routes it away from the usage path. The HID map has a second collection (Consumer Control, report ID 2) for the Media screen's play/next/prev — changing the HID map or GATT layout requires the host to forget and re-pair.

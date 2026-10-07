@@ -5,6 +5,7 @@
 enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
+    SCREEN_CODEX,
     SCREEN_MEDIA,
     SCREEN_COUNT,
 };
@@ -22,3 +23,6 @@ void ui_update_battery(int percent, bool charging);
 void ui_update_now_playing(const NowPlaying* np);
 int  ui_media_art_px(void);                    // cover edge length for this panel
 void ui_set_media_art(const uint8_t* rgb565);  // px×px RGB565 LE, must stay valid
+
+// Codex screen
+void ui_update_codex(const CodexUsage* cx);

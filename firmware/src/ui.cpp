@@ -540,6 +540,67 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
 }
 
+// ---- Codex screen: OpenAI Codex 5-hour + weekly limits, same panels as Usage ----
+static lv_obj_t* codex_container;
+static lv_obj_t* codex_group;       // the two panels, hidden until data arrives
+static lv_obj_t* lbl_codex_empty;
+static lv_obj_t *lbl_cx_session_pct, *lbl_cx_session_pill, *bar_cx_session, *lbl_cx_session_reset;
+static lv_obj_t *lbl_cx_weekly_pct,  *lbl_cx_weekly_pill,  *bar_cx_weekly,  *lbl_cx_weekly_reset;
+
+static void init_codex_screen(lv_obj_t* scr) {
+    codex_container = lv_obj_create(scr);
+    lv_obj_set_size(codex_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(codex_container, 0, 0);
+    lv_obj_set_style_bg_opa(codex_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(codex_container, 0, 0);
+    lv_obj_set_style_pad_all(codex_container, 0, 0);
+    lv_obj_clear_flag(codex_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(codex_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* title = lv_label_create(codex_container);
+    lv_label_set_text(title, "Codex");
+    lv_obj_set_style_text_font(title, L.title_font, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+
+    codex_group = lv_obj_create(codex_container);
+    lv_obj_set_size(codex_group, L.scr_w, L.scr_h);
+    lv_obj_set_pos(codex_group, 0, 0);
+    lv_obj_set_style_bg_opa(codex_group, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(codex_group, 0, 0);
+    lv_obj_set_style_pad_all(codex_group, 0, 0);
+    lv_obj_clear_flag(codex_group, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(codex_group, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    make_usage_panel(codex_group, L.content_y, "Current",
+                     &lbl_cx_session_pct, &lbl_cx_session_pill,
+                     &bar_cx_session, &lbl_cx_session_reset);
+    make_usage_panel(codex_group, L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
+                     &lbl_cx_weekly_pct, &lbl_cx_weekly_pill,
+                     &bar_cx_weekly, &lbl_cx_weekly_reset);
+    lv_obj_add_flag(codex_group, LV_OBJ_FLAG_HIDDEN);
+
+    // The daemon only sends Codex limits once Codex has been used on the host.
+    lbl_codex_empty = lv_label_create(codex_container);
+    lv_label_set_text(lbl_codex_empty, "No Codex data yet");
+    lv_obj_set_style_text_font(lbl_codex_empty, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl_codex_empty, COL_DIM, 0);
+    lv_obj_align(lbl_codex_empty, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void set_codex_panel(lv_obj_t* pct, lv_obj_t* bar, lv_obj_t* reset,
+                            float value, int reset_mins) {
+    int v = (int)(value + 0.5f);
+    char buf[48];
+    lv_label_set_text_fmt(pct, "%d%%", v);
+    lv_bar_set_value(bar, v, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar, pct_color(value), LV_PART_INDICATOR);
+    format_reset_time(reset_mins, buf, sizeof(buf));
+    lv_label_set_text(reset, buf);
+}
+
 // ---- Media screen: previous / play-pause / next as BLE HID media keys ----
 static lv_obj_t* media_container;
 static lv_obj_t* media_art_box;     // rounded placeholder; clips the cover
@@ -752,6 +813,7 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    init_codex_screen(scr);
     init_media_screen(scr);
     splash_init(scr);
 
@@ -959,7 +1021,7 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Tapping empty space cycles splash → usage → media → splash.
+// Tapping empty space cycles splash → usage → codex → media → splash.
 static void global_click_cb(lv_event_t* e) {
     (void)e;
     ui_show_screen((screen_t)((current_screen + 1) % SCREEN_COUNT));
@@ -967,12 +1029,14 @@ static void global_click_cb(lv_event_t* e) {
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(media_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:  splash_show(); break;
     case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_CODEX:   lv_obj_clear_flag(codex_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_MEDIA:   lv_obj_clear_flag(media_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
@@ -1052,4 +1116,15 @@ void ui_set_media_art(const uint8_t* rgb565) {
     lv_image_set_src(media_art_img, &media_art_dsc);
     lv_obj_clear_flag(media_art_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(media_art_img);
+}
+
+// ---- Codex screen API ----
+
+void ui_update_codex(const CodexUsage* cx) {
+    lv_obj_add_flag(lbl_codex_empty, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(codex_group, LV_OBJ_FLAG_HIDDEN);
+    set_codex_panel(lbl_cx_session_pct, bar_cx_session, lbl_cx_session_reset,
+                    cx->session_pct, cx->session_reset_mins);
+    set_codex_panel(lbl_cx_weekly_pct, bar_cx_weekly, lbl_cx_weekly_reset,
+                    cx->weekly_pct, cx->weekly_reset_mins);
 }

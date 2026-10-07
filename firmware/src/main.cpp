@@ -23,6 +23,7 @@
 
 static UsageData usage = {};
 static NowPlaying now_playing = {};
+static CodexUsage codex = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -99,12 +100,14 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 }
 
 // Parse a JSON line into UsageData.
-enum payload_t { PAYLOAD_BAD, PAYLOAD_USAGE, PAYLOAD_NOW_PLAYING };
+enum payload_t { PAYLOAD_BAD, PAYLOAD_USAGE, PAYLOAD_NOW_PLAYING, PAYLOAD_CODEX };
 
 // Daemon payloads share the RX characteristic: usage beats are flat objects,
-// now-playing updates arrive wrapped as {"np":{...}} and must not be read as
-// usage (a missing "ok" would flip the usage view to "No data").
-static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np) {
+// now-playing and Codex updates arrive wrapped as {"np":{...}} / {"cx":{...}}
+// and must not be read as usage (a missing "ok" would flip the usage view to
+// "No data").
+static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np,
+                            CodexUsage* cx) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -118,6 +121,15 @@ static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np) {
         strlcpy(np->title, npj["t"] | "", sizeof(np->title));
         strlcpy(np->artist, npj["a"] | "", sizeof(np->artist));
         return PAYLOAD_NOW_PLAYING;
+    }
+
+    JsonObjectConst cxj = doc["cx"];
+    if (!cxj.isNull()) {
+        cx->session_pct = cxj["s"] | 0.0f;
+        cx->session_reset_mins = cxj["sr"] | -1;
+        cx->weekly_pct = cxj["w"] | 0.0f;
+        cx->weekly_reset_mins = cxj["wr"] | -1;
+        return PAYLOAD_CODEX;
     }
 
     out->session_pct = doc["s"] | 0.0f;
@@ -387,9 +399,12 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        payload_t kind = parse_json(ble_get_data(), &usage, &now_playing);
+        payload_t kind = parse_json(ble_get_data(), &usage, &now_playing, &codex);
         if (kind == PAYLOAD_NOW_PLAYING) {
             ui_update_now_playing(&now_playing);
+            ble_send_ack();
+        } else if (kind == PAYLOAD_CODEX) {
+            ui_update_codex(&codex);
             ble_send_ack();
         } else if (kind == PAYLOAD_USAGE) {
             int g_before = usage_rate_group();
