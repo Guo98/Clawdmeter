@@ -1,19 +1,24 @@
-"""GitHub PR notifications for the Clawdmeter GitHub screen.
+"""GitHub PRs for the Clawdmeter PRs screen.
 
-Lists the signed-in user's unread notifications on pull requests they
-participate in (review requested, mentioned, authored, commented, assigned)
-via the `gh` CLI, so it reuses whatever account `gh auth login` set up and
-never handles a token itself.
+The badge counts open PRs waiting on the signed-in user's review. The list
+shows those first, then other unread notifications on PRs the user
+participates in (mentioned, authored, commented, assigned), up to MAX_ROWS.
+Everything goes through the `gh` CLI, so it reuses whatever account
+`gh auth login` set up and never handles a token itself.
+
+The list is bigger than one BLE write (the firmware RX buffer is 512 bytes),
+so it goes out as a few {"gh":{...,"o":offset,"t":rows}} chunks that the
+device reassembles.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import unicodedata
 from pathlib import Path
 
-MAX_ITEMS = 4        # firmware GH_MAX_ITEMS
-MAX_PAGES = 3        # count up to 150; the display caps at "99+" anyway
+MAX_ROWS = 12        # firmware GH_MAX_ITEMS
 PAYLOAD_LIMIT = 480  # firmware RX buffer is 512 bytes
 REF_MAX, TITLE_MAX = 36, 64
 
@@ -51,53 +56,131 @@ def _ascii(s: str, limit: int) -> str:
     return folded if len(folded) <= limit else folded[: limit - 3].rstrip() + "..."
 
 
-def _fetch() -> list[dict] | None:
+def _run_gh(*args: str) -> str:
     gh = _gh()
     if not gh:
-        return None
-    # Page by hand rather than --paginate: a backlog of hundreds of unread
-    # notifications would otherwise cost a dozen requests every poll.
-    notifs: list[dict] = []
-    for page in range(1, MAX_PAGES + 1):
-        res = subprocess.run(
-            [gh, "api", f"/notifications?participating=true&per_page=50&page={page}"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.strip()[:200] or f"gh exited {res.returncode}")
-        batch = json.loads(res.stdout or "[]")
-        notifs.extend(batch)
-        if len(batch) < 50:
-            break
-    return notifs
+        raise RuntimeError("gh not found")
+    res = subprocess.run([gh, *args], capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip()[:200] or f"gh exited {res.returncode}")
+    return res.stdout
 
 
-def payload() -> dict | None:
-    """The {"gh": {...}} device payload, or None if gh is missing.
+def _review_requests() -> list[dict]:
+    """Open PRs requesting the user's (or their team's) review, newest first."""
+    out = _run_gh("search", "prs", "--review-requested=@me", "--state=open",
+                  "--sort=updated", "--json", "number,title,repository,url",
+                  "--limit", "50")
+    return [{
+        "ref": f"{pr['repository']['name']}#{pr['number']}",
+        "title": pr.get("title", ""),
+        "reason": "Review",
+        "url": pr["url"],
+    } for pr in json.loads(out or "[]")]
 
-    Raises RuntimeError when gh fails (e.g. signed out) so the caller can log it.
-    """
-    notifs = _fetch()
-    if notifs is None:
-        return None
-    prs = [n for n in notifs if n.get("subject", {}).get("type") == "PullRequest"]
-    items = []
-    for n in prs[:MAX_ITEMS]:
-        repo = n.get("repository", {}).get("name", "")
-        number = (n.get("subject", {}).get("url") or "").rsplit("/", 1)[-1]
-        ref = f"{repo}#{number}" if number.isdigit() else repo
+
+_API_PR = re.compile(r"^https://api\.github\.com/repos/([^/]+/[^/]+)/pulls/(\d+)$")
+
+
+def html_url(n: dict) -> str:
+    """Browser URL for a PR notification (the API gives an api.github.com URL)."""
+    m = _API_PR.match(n.get("subject", {}).get("url") or "")
+    if m:
+        return f"https://github.com/{m.group(1)}/pull/{m.group(2)}"
+    return n.get("repository", {}).get("html_url") or "https://github.com/notifications"
+
+
+def _notifications() -> list[dict]:
+    """Unread PR notifications that involve the user, newest first. Review
+    requests are left to the search above, which only sees open PRs."""
+    notifs = json.loads(_run_gh("api", "/notifications?participating=true&per_page=50") or "[]")
+    rows = []
+    for n in notifs:
+        subject = n.get("subject", {})
         reason = n.get("reason", "")
-        items.append([
-            _ascii(ref, REF_MAX),
-            _ascii(n.get("subject", {}).get("title", ""), TITLE_MAX),
-            REASONS.get(reason, reason.replace("_", " ").title()[:12]),
-        ])
-    out = {"gh": {"n": len(prs), "i": items}}
-    # Keep under the firmware's RX buffer; drop the oldest rows if needed.
-    while items and len(json.dumps(out, separators=(",", ":"))) > PAYLOAD_LIMIT:
-        items.pop()
-    return out
+        if subject.get("type") != "PullRequest" or reason == "review_requested":
+            continue
+        number = (subject.get("url") or "").rsplit("/", 1)[-1]
+        repo = n.get("repository", {}).get("name", "")
+        rows.append({
+            "ref": f"{repo}#{number}" if number.isdigit() else repo,
+            "title": subject.get("title", ""),
+            "reason": REASONS.get(reason, reason.replace("_", " ").title()[:12]),
+            "url": html_url(n),
+        })
+    return rows
+
+
+def _chunks(count: int, rows: list[dict], blip: bool) -> list[dict]:
+    """Split rows into {"gh":{...}} payloads that each fit one BLE write."""
+    items = [[_ascii(r["ref"], REF_MAX), _ascii(r["title"], TITLE_MAX), r["reason"]]
+             for r in rows]
+    out: list[dict] = []
+    off = 0
+    while True:
+        msg = {"n": count, "o": off, "t": len(items), "i": []}
+        if blip and not out:
+            msg["b"] = 1
+        while off < len(items):
+            msg["i"].append(items[off])
+            if len(json.dumps({"gh": msg}, separators=(",", ":"))) > PAYLOAD_LIMIT:
+                msg["i"].pop()
+                break
+            off += 1
+        out.append({"gh": msg})
+        if off >= len(items) or not msg["i"]:
+            return out
+
+
+class Watcher:
+    """Builds the device payloads and flags review requests that are new.
+
+    Lives for the whole daemon run (not per BLE connection), and the first
+    poll only records a baseline, so a restart or reconnect never replays a
+    blip for requests that were already waiting. Seen PRs accumulate, so one
+    that drops off and comes back (re-requested after a review) stays quiet.
+    """
+
+    def __init__(self) -> None:
+        self.seen_reviews: set[str] | None = None
+        self.urls: list[str] = []   # browser URL per row of the last payload
+
+    def open_row(self, row: int) -> str | None:
+        """Open the PR shown on device row ``row``; returns its URL."""
+        if not 0 <= row < len(self.urls):
+            return None
+        subprocess.run(["open", self.urls[row]], check=True, timeout=10)
+        return self.urls[row]
+
+    def poll(self) -> list[dict] | None:
+        if not is_available():
+            return None
+        reviews = _review_requests()
+        review_urls = {r["url"] for r in reviews}
+        others = [r for r in _notifications() if r["url"] not in review_urls]
+        rows = (reviews + others)[:MAX_ROWS]
+
+        new = review_urls - self.seen_reviews if self.seen_reviews is not None else set()
+        self.seen_reviews = (self.seen_reviews or set()) | review_urls
+        self.urls = [r["url"] for r in rows]
+        return _chunks(len(reviews), rows, bool(new) and blip_enabled())
+
+
+CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
+
+
+def blip_enabled() -> bool:
+    """`review_blip = off` in the daemon config silences the review blip."""
+    try:
+        for line in CONFIG_FILE.read_text().splitlines():
+            key, sep, val = line.partition("=")
+            if sep and key.strip().lower() == "review_blip":
+                return val.split("#")[0].strip().lower() != "off"
+    except OSError:
+        pass
+    return True
 
 
 if __name__ == "__main__":
-    print(json.dumps(payload(), indent=2))
+    for msg in Watcher().poll() or []:
+        print(json.dumps(msg, separators=(",", ":")))

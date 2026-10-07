@@ -21,6 +21,14 @@ void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
 
+// Device → daemon commands ride the refresh-request characteristic as a
+// one-byte notify (0x01 stays "refresh"). Old daemons treat any value as a
+// refresh, which is harmless.
+#define CMD_ZOOM_MIC   0x10
+#define CMD_ZOOM_VIDEO 0x11
+#define CMD_GH_OPEN    0x20   // + row index: open that PR in the browser
+void ble_send_command(uint8_t cmd);
+
 void ble_set_battery_level(int pct);
 
 // BLE HID keyboard

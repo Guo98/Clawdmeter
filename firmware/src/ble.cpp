@@ -556,6 +556,14 @@ void ble_request_refresh(void) {
     }
 }
 
+void ble_send_command(uint8_t cmd) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        req_char->setValue(&cmd, 1);
+        req_char->notify();
+        Serial.printf("BLE: command 0x%02x\n", cmd);
+    }
+}
+
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {
     if (state != BLE_STATE_CONNECTED || !input_kbd) return;
     // HID report: [modifier, reserved, key1, key2, key3, key4, key5, key6]

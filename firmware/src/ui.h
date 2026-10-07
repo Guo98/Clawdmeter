@@ -8,6 +8,7 @@ enum screen_t {
     SCREEN_CODEX,
     SCREEN_GITHUB,
     SCREEN_MEDIA,
+    SCREEN_ZOOM,
     SCREEN_COUNT,
 };
 
@@ -30,3 +31,6 @@ void ui_update_codex(const CodexUsage* cx);
 
 // GitHub screen
 void ui_update_github(const GithubNotifs* gh);
+
+// Zoom screen
+void ui_update_zoom(const ZoomStatus* zm);

@@ -39,9 +39,10 @@ struct CodexUsage {
     int   weekly_reset_mins;
 };
 
-// GitHub PR notifications pushed by the daemon as
-// {"gh":{"n":total,"i":[[ref, title, reason], ...]}} — newest first.
-#define GH_MAX_ITEMS 4
+// GitHub PRs pushed by the daemon in chunks of
+// {"gh":{"n":reviews,"o":offset,"t":rows,"i":[[ref, title, reason], ...],"b":1?}}
+// — rows o.. of t; "b" (first chunk only) asks for the review-request blip.
+#define GH_MAX_ITEMS 12
 struct GithubItem {
     char ref[40];            // "repo#123"
     char title[72];
@@ -49,7 +50,22 @@ struct GithubItem {
 };
 
 struct GithubNotifs {
-    int total;               // unread PR notifications (may exceed count)
-    int count;               // items[] filled, <= GH_MAX_ITEMS
+    int total;               // open PRs awaiting the user's review
+    int count;               // rows in the list, <= GH_MAX_ITEMS
+    bool blip;               // a new review request arrived since the last poll
     GithubItem items[GH_MAX_ITEMS];
+};
+
+// Zoom meeting state pushed by the daemon as {"zm":{"s":..,"a":..,"v":..}}.
+enum zoom_state_t {
+    ZOOM_OFF = 0,          // Zoom not running
+    ZOOM_IDLE = 1,         // running, not in a meeting
+    ZOOM_MEETING = 2,
+    ZOOM_NO_ACCESS = 3,    // daemon lacks macOS Accessibility permission
+};
+
+struct ZoomStatus {
+    int  state;            // zoom_state_t
+    bool muted;
+    bool video;            // camera on
 };

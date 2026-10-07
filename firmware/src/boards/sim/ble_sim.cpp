@@ -118,6 +118,7 @@ const char* ble_get_data(void) {
 void ble_send_ack(void)  {}
 void ble_send_nack(void) { printf("[sim] payload NACKed — check the scenario JSON\n"); }
 void ble_request_refresh(void) {}
+void ble_send_command(uint8_t cmd) { printf("[sim] command 0x%02x\n", cmd); }
 void ble_set_battery_level(int pct) { (void)pct; }
 
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {

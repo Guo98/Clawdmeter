@@ -25,6 +25,7 @@ static UsageData usage = {};
 static NowPlaying now_playing = {};
 static CodexUsage codex = {};
 static GithubNotifs github = {};
+static ZoomStatus zoom = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -101,15 +102,16 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 }
 
 // Parse a JSON line into UsageData.
-enum payload_t { PAYLOAD_BAD, PAYLOAD_USAGE, PAYLOAD_NOW_PLAYING, PAYLOAD_CODEX, PAYLOAD_GITHUB };
+enum payload_t { PAYLOAD_BAD, PAYLOAD_USAGE, PAYLOAD_NOW_PLAYING, PAYLOAD_CODEX, PAYLOAD_GITHUB,
+                 PAYLOAD_ZOOM, PAYLOAD_PARTIAL };
 
 // Daemon payloads share the RX characteristic: usage beats are flat objects,
-// now-playing, Codex and GitHub updates arrive wrapped as {"np":{...}},
-// {"cx":{...}} or {"gh":{...}}
+// now-playing, Codex, GitHub and Zoom updates arrive wrapped as {"np":{...}},
+// {"cx":{...}}, {"gh":{...}} or {"zm":{...}}
 // and must not be read as usage (a missing "ok" would flip the usage view to
 // "No data").
 static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np,
-                            CodexUsage* cx, GithubNotifs* gh) {
+                            CodexUsage* cx, GithubNotifs* gh, ZoomStatus* zm) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -136,16 +138,31 @@ static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np,
 
     JsonObjectConst ghj = doc["gh"];
     if (!ghj.isNull()) {
+        // Chunked: rows arrive at offset "o" of "t"; the list is only shown
+        // once the last chunk lands, so a half-updated list never flashes.
+        int off = ghj["o"] | 0;
+        int rows = ghj["t"] | 0;
+        if (rows > GH_MAX_ITEMS) rows = GH_MAX_ITEMS;
+        if (off == 0) gh->blip = (ghj["b"] | 0) != 0;   // sent as 1, not true
         gh->total = ghj["n"] | 0;
-        gh->count = 0;
+        gh->count = rows;
+        int i = off;
         for (JsonArrayConst it : ghj["i"].as<JsonArrayConst>()) {
-            if (gh->count >= GH_MAX_ITEMS) break;
-            GithubItem& g = gh->items[gh->count++];
+            if (i >= rows) break;
+            GithubItem& g = gh->items[i++];
             strlcpy(g.ref, it[0] | "", sizeof(g.ref));
             strlcpy(g.title, it[1] | "", sizeof(g.title));
             strlcpy(g.reason, it[2] | "", sizeof(g.reason));
         }
-        return PAYLOAD_GITHUB;
+        return i >= rows ? PAYLOAD_GITHUB : PAYLOAD_PARTIAL;
+    }
+
+    JsonObjectConst zmj = doc["zm"];
+    if (!zmj.isNull()) {
+        zm->state = zmj["s"] | (int)ZOOM_OFF;
+        zm->muted = (zmj["a"] | 0) != 0;   // 0/1 ints; `| false` would reject them
+        zm->video = (zmj["v"] | 0) != 0;
+        return PAYLOAD_ZOOM;
     }
 
     out->session_pct = doc["s"] | 0.0f;
@@ -153,7 +170,7 @@ static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np,
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
+    out->chime = (doc["c"] | 0) != 0;   // sent as 1; absent (old daemon / chime off) → stay silent
     const char* acct = doc["acct"] | "pro";
     out->enterprise = (strcmp(acct, "ent") == 0);
     out->time_pct = doc["tp"] | 0;
@@ -216,6 +233,7 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
+            else if (strcmp(cmd_buf, "blip") == 0)  sound_hal_play_blip();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -415,7 +433,7 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        payload_t kind = parse_json(ble_get_data(), &usage, &now_playing, &codex, &github);
+        payload_t kind = parse_json(ble_get_data(), &usage, &now_playing, &codex, &github, &zoom);
         if (kind == PAYLOAD_NOW_PLAYING) {
             ui_update_now_playing(&now_playing);
             ble_send_ack();
@@ -423,7 +441,13 @@ void loop() {
             ui_update_codex(&codex);
             ble_send_ack();
         } else if (kind == PAYLOAD_GITHUB) {
+            if (github.blip) sound_hal_play_blip();   // no-op on boards without audio
             ui_update_github(&github);
+            ble_send_ack();
+        } else if (kind == PAYLOAD_PARTIAL) {
+            ble_send_ack();   // more chunks to come
+        } else if (kind == PAYLOAD_ZOOM) {
+            ui_update_zoom(&zoom);
             ble_send_ack();
         } else if (kind == PAYLOAD_USAGE) {
             int g_before = usage_rate_group();

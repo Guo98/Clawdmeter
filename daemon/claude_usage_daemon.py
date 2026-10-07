@@ -29,8 +29,9 @@ try:  # run as a script (launchd) vs imported as daemon.* (tests)
     import codex
     import github
     import spotify
+    import zoom
 except ImportError:
-    from daemon import codex, github, spotify
+    from daemon import codex, github, spotify, zoom
 
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
@@ -547,6 +548,7 @@ class PlanSelector:
 
 # Module-level so the active-plan state survives reconnects.
 _SELECTOR = PlanSelector()
+_GITHUB = github.Watcher()   # daemon-lifetime, so reconnects don't re-blip
 
 
 async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, bool]:
@@ -606,10 +608,19 @@ class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        self.commands: list[int] = []     # device button presses (zoom.CMD_*)
+        self.wake = asyncio.Event()       # either of the above arrived
 
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
-        self.refresh_requested.set()
+    def _on_refresh(self, _char, data: bytearray) -> None:
+        # One byte: 0x01 = refresh, 0x10+ = a command from a device screen.
+        code = data[0] if data else 0x01
+        if code >= 0x10:
+            log(f"Device command 0x{code:02x}")
+            self.commands.append(code)
+        else:
+            log("Refresh requested by device")
+            self.refresh_requested.set()
+        self.wake.set()
 
     async def setup_refresh_subscription(self) -> None:
         # start_notify awaits CoreBluetooth's CCCD-write confirmation, which
@@ -849,8 +860,9 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
     last_poll = 0.0
     last_codex: dict | None = None
-    last_github: dict | None = None
+    last_github: list[dict] | None = None
     last_github_poll = 0.0
+    last_zoom: dict | None = None
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
@@ -870,12 +882,6 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                     if await session.write_payload(payload):
                         last_poll = time.time()
                         used_successfully = True
-                # Codex limits ride the same cadence; local file read only, and
-                # only re-sent when a value (incl. the reset countdown) changes.
-                cx = codex.payload()
-                if cx is not None and cx != last_codex:
-                    if await session.write_payload(cx):
-                        last_codex = cx
                 elif dead:
                     # No live token in any config dir (missing, or a 401/expired
                     # token) -> show "No data" now instead of stale numbers. Guard
@@ -890,25 +896,68 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                     # Transient poll failure (a live token that didn't answer this
                     # cycle) -> stay silent and retry next tick.
                     log("No usable config dir this cycle")
+                # Codex limits ride the same cadence; local file read only, and
+                # only re-sent when a value (incl. the reset countdown) changes.
+                cx = codex.payload()
+                if cx is not None and cx != last_codex:
+                    if await session.write_payload(cx):
+                        last_codex = cx
 
             if media:
                 await media.tick()
 
+            # GitHub row taps (0x20 + row) open that PR in the browser.
+            for cmd in [c for c in session.commands if 0x20 <= c < 0x30]:
+                session.commands.remove(cmd)
+                try:
+                    url = await asyncio.to_thread(_GITHUB.open_row, cmd - 0x20)
+                    log(f"Opened {url}" if url else f"No PR on row {cmd - 0x20}")
+                except (OSError, subprocess.SubprocessError) as e:
+                    log(f"Opening PR failed: {e}")
+
+            if zoom.available():
+                while session.commands:
+                    cmd = session.commands.pop(0)
+                    try:
+                        note = await asyncio.to_thread(zoom.command, cmd)
+                        if note:
+                            log(f"Zoom command 0x{cmd:02x}: {note}")
+                    except (zoom.NoAccess, RuntimeError, OSError, subprocess.SubprocessError) as e:
+                        log(f"Zoom command 0x{cmd:02x} failed: {e}")
+                    last_zoom = None   # re-send so the device drops its optimistic flip
+                try:
+                    zm = await asyncio.to_thread(zoom.payload)
+                except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                    log(f"Zoom poll failed: {e}")
+                    zm = None
+                if zm is not None and zm != last_zoom:
+                    if zm["zm"]["s"] == zoom.ZOOM_NO_ACCESS and (last_zoom or {}).get("zm", {}).get("s") != zoom.ZOOM_NO_ACCESS:
+                        log("Zoom: needs Accessibility permission; add "
+                            f"{zoom.permission_target()} in System Settings > "
+                            "Privacy & Security > Accessibility")
+                    if await session.write_payload(zm):
+                        last_zoom = zm
+
             if github.is_available() and time.time() - last_github_poll >= GITHUB_POLL:
                 last_github_poll = time.time()
                 try:
-                    gh = await asyncio.to_thread(github.payload)
+                    gh = await asyncio.to_thread(_GITHUB.poll)
                 except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as e:
                     log(f"GitHub poll failed: {e}")
                     gh = None
+                # A list of chunks; resend all if anything changed.
                 if gh is not None and gh != last_github:
-                    if await session.write_payload(gh):
+                    sent = True
+                    for msg in gh:
+                        sent = await session.write_payload(msg) and sent
+                    if sent:
                         last_github = gh
 
             try:
-                await asyncio.wait_for(session.refresh_requested.wait(), timeout=tick)
+                await asyncio.wait_for(session.wake.wait(), timeout=tick)
             except asyncio.TimeoutError:
                 pass
+            session.wake.clear()
     finally:
         try:
             await client.disconnect()

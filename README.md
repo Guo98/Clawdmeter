@@ -14,11 +14,13 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
 ## Screens
 
-The device boots into the splash. Tap empty space on the screen to cycle splash → Usage → Codex → PRs → Media → splash.
+The device boots into the splash. Swipe left/right anywhere, or tap empty space, to cycle splash → Usage → Codex → PRs → Media → Zoom → splash.
 
 The **Codex** screen shows your OpenAI Codex 5-hour and weekly limits. The daemon reads them from Codex CLI's local session logs (`~/.codex/sessions`), so no setup is needed — but the numbers only update when Codex is used on that machine.
 
-The **PRs** screen lists your newest unread GitHub notifications on pull requests you're involved in (review requested, mentioned, authored, commented, assigned), with the unread total beside the title. The daemon polls every 2 minutes through the [GitHub CLI](https://cli.github.com/), so it shows whichever account `gh auth login` is signed in to; without `gh` installed the screen stays empty. Marking notifications read on GitHub clears them here.
+The **PRs** screen counts open pull requests waiting on your review (badge beside the title) and lists them first, followed by other unread notifications on PRs you're involved in (mentioned, authored, commented, assigned) — up to 12 rows, scrollable. Tap a row to open that PR in your browser on the Mac. When a new review request arrives the device plays a short blip (boards with a speaker); set `review_blip = off` in `~/.config/claude-usage-monitor/config` to silence it. The daemon polls every 2 minutes through the [GitHub CLI](https://cli.github.com/), so it shows whichever account `gh auth login` is signed in to; without `gh` installed the screen stays empty.
+
+The **Zoom** screen (macOS) shows whether you're in a Zoom meeting and toggles your mic and camera — tiles show the current state (red with a slash = muted / camera off). The daemon drives the Zoom desktop app through its Meeting menu, so Zoom doesn't need to be in front. It needs the macOS **Accessibility** permission: the daemon logs the exact app to add (for Homebrew Python, `…/Python.framework/Versions/3.x/Resources/Python.app`) under System Settings → Privacy & Security → Accessibility; until then the screen says so. A Homebrew Python upgrade changes that path, so re-add it after one.
 
 The **Media** screen has previous / play-pause / next buttons, sent to the host as standard Bluetooth media keys, so they control whatever is playing on the Mac (Spotify desktop, the Spotify web player, Music, YouTube…). On macOS it can also show the current Spotify track, artist, and album art — see [Spotify now playing](#spotify-now-playing-macos).
 

@@ -313,6 +313,14 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
+static void gesture_cb(lv_event_t* e);
+
+// LVGL still sends CLICKED on release after a swipe; tap handlers check this
+// so a swipe that starts on a button doesn't also press it.
+static bool tap_was_swipe(void) {
+    lv_indev_t* indev = lv_indev_active();
+    return indev && lv_indev_get_gesture_dir(indev) != LV_DIR_NONE;
+}
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -606,10 +614,17 @@ static lv_obj_t* github_container;
 static lv_obj_t* lbl_github_title;
 static lv_obj_t* lbl_github_count;   // pill beside the title
 static lv_obj_t* lbl_github_empty;
+static lv_obj_t* gh_list;            // vertically scrollable column of rows
 static lv_obj_t* gh_row[GH_MAX_ITEMS];
 static lv_obj_t* gh_reason[GH_MAX_ITEMS];
 static lv_obj_t* gh_ref[GH_MAX_ITEMS];
 static lv_obj_t* gh_title[GH_MAX_ITEMS];
+
+// Tapping a row asks the daemon to open that PR in the Mac's browser.
+static void gh_row_cb(lv_event_t* e) {
+    if (tap_was_swipe()) return;
+    ble_send_command(CMD_GH_OPEN + (uint8_t)(uintptr_t)lv_event_get_user_data(e));
+}
 
 static void init_github_screen(lv_obj_t* scr) {
     github_container = lv_obj_create(scr);
@@ -638,9 +653,26 @@ static void init_github_screen(lv_obj_t* scr) {
     const int32_t row_h = 2 * L.panel_pad_y + meta_h + 4 + lv_font_get_line_height(title_font);
     const int32_t gap = L.usage_panel_gap / 2;
     const int32_t inner_w = L.content_w - 2 * L.panel_pad_x;
+
+    // Rows live in a column that scrolls vertically; horizontal swipes still
+    // reach the screen-switch gesture since nothing scrolls sideways.
+    gh_list = lv_obj_create(github_container);
+    lv_obj_remove_style_all(gh_list);
+    lv_obj_set_pos(gh_list, L.margin, L.content_y);
+    lv_obj_set_size(gh_list, L.content_w, L.scr_h - L.content_y - L.margin);
+    lv_obj_set_flex_flow(gh_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(gh_list, gap, 0);
+    lv_obj_set_scroll_dir(gh_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(gh_list, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_add_event_cb(gh_list, global_click_cb, LV_EVENT_CLICKED, NULL);
+
     for (int i = 0; i < GH_MAX_ITEMS; i++) {
-        gh_row[i] = make_panel(github_container, L.margin, L.content_y + i * (row_h + gap),
-                               L.content_w, row_h);
+        gh_row[i] = make_panel(gh_list, 0, 0, L.content_w, row_h);
+        // Rows take the tap themselves (no bubbling to the screen cycle).
+        lv_obj_remove_flag(gh_row[i], LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(gh_row[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_bg_color(gh_row[i], lv_color_lighten(COL_PANEL, LV_OPA_20), LV_STATE_PRESSED);
+        lv_obj_add_event_cb(gh_row[i], gh_row_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
 
         gh_reason[i] = lv_label_create(gh_row[i]);
         lv_obj_set_style_text_font(gh_reason[i], meta_font, 0);
@@ -754,6 +786,7 @@ static void media_icon_draw_cb(lv_event_t* e) {
 }
 
 static void media_btn_cb(lv_event_t* e) {
+    if (tap_was_swipe()) return;
     uint16_t usage = (uint16_t)(uintptr_t)lv_event_get_user_data(e);
     ble_media_tap(usage);
     // Flip the icon right away; the daemon's next poll (~3 s) confirms it.
@@ -870,6 +903,205 @@ static void init_media_screen(lv_obj_t* scr) {
     lv_obj_add_flag(media_container, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ---- Zoom screen: mic / camera toggles, executed by the daemon ----
+// Taps go to the daemon as one-byte commands; it clicks Zoom's own menu items
+// (no focus steal) and reports the resulting state back as {"zm":{...}}.
+static lv_obj_t* zoom_container;
+static lv_obj_t* lbl_zoom_status;
+static lv_obj_t* zoom_mic_btn;
+static lv_obj_t* zoom_cam_btn;
+static lv_obj_t* lbl_zoom_mic;
+static lv_obj_t* lbl_zoom_cam;
+static ZoomStatus zoom_st = {};
+static bool zoom_received = false;
+
+static void draw_line(lv_layer_t* layer, int32_t x1, int32_t y1, int32_t x2, int32_t y2,
+                      int32_t w, lv_color_t col) {
+    lv_draw_line_dsc_t d;
+    lv_draw_line_dsc_init(&d);
+    d.color = col;
+    d.width = w;
+    d.round_start = 1;
+    d.round_end = 1;
+    d.p1.x = x1; d.p1.y = y1;
+    d.p2.x = x2; d.p2.y = y2;
+    lv_draw_line(layer, &d);
+}
+
+// Mic and camera glyphs, drawn like the media icons. Struck through when off.
+static void zoom_icon_draw_cb(lv_event_t* e) {
+    lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+    lv_layer_t* layer = lv_event_get_layer(e);
+    const bool is_mic = (btn == zoom_mic_btn);
+    lv_area_t c;
+    lv_obj_get_coords(btn, &c);
+    const int32_t w = lv_area_get_width(&c), h = lv_area_get_height(&c);
+    const int32_t u  = LV_MIN(w, h) / 14;
+    const int32_t cx = (c.x1 + c.x2) / 2;
+    const int32_t cy = c.y1 + h * 42 / 100;   // above the caption
+    const int32_t sw = LV_MAX(u * 5 / 10, 2);  // stroke width
+    const bool off = is_mic ? zoom_st.muted : !zoom_st.video;
+
+    if (is_mic) {
+        // capsule + cradle + stem + base
+        lv_draw_rect_dsc_t r;
+        lv_draw_rect_dsc_init(&r);
+        r.bg_color = COL_TEXT;
+        r.bg_opa = LV_OPA_COVER;
+        r.radius = LV_RADIUS_CIRCLE;
+        lv_area_t cap = {cx - u * 12 / 10, cy - u * 32 / 10, cx + u * 12 / 10, cy + u * 8 / 10};
+        lv_draw_rect(layer, &r, &cap);
+
+        lv_draw_arc_dsc_t a;
+        lv_draw_arc_dsc_init(&a);
+        a.color = COL_TEXT;
+        a.width = sw;
+        a.rounded = 1;
+        a.center.x = cx;
+        a.center.y = cy - u * 2 / 10;
+        a.radius = u * 21 / 10;
+        a.start_angle = 0;
+        a.end_angle = 180;
+        lv_draw_arc(layer, &a);
+
+        const int32_t stem_top = a.center.y + a.radius;
+        draw_line(layer, cx, stem_top, cx, stem_top + u, sw, COL_TEXT);
+        draw_line(layer, cx - u * 12 / 10, stem_top + u, cx + u * 12 / 10, stem_top + u, sw, COL_TEXT);
+    } else {
+        // camera body + lens wedge
+        lv_draw_rect_dsc_t r;
+        lv_draw_rect_dsc_init(&r);
+        r.bg_color = COL_TEXT;
+        r.bg_opa = LV_OPA_COVER;
+        r.radius = u / 2;
+        lv_area_t body = {cx - u * 30 / 10, cy - u * 18 / 10, cx + u * 10 / 10, cy + u * 18 / 10};
+        lv_draw_rect(layer, &r, &body);
+        fill_tri(layer, cx + u * 14 / 10, cy, cx + u * 30 / 10, cy - u * 16 / 10,
+                 cx + u * 30 / 10, cy + u * 16 / 10);
+    }
+
+    if (off) {
+        // Slash with a background-colored halo so it reads as cut through.
+        lv_color_t bg = lv_obj_get_style_bg_color(btn, LV_PART_MAIN);
+        draw_line(layer, cx - u * 30 / 10, cy - u * 32 / 10, cx + u * 30 / 10, cy + u * 32 / 10,
+                  sw * 3, bg);
+        draw_line(layer, cx - u * 30 / 10, cy - u * 32 / 10, cx + u * 30 / 10, cy + u * 32 / 10,
+                  sw, COL_TEXT);
+    }
+}
+
+// Status line, captions, colors and enabled state from the latest report.
+static void zoom_refresh(void) {
+    if (!lbl_zoom_status) return;
+    const char* status;
+    lv_color_t status_col = COL_DIM;
+    bool in_meeting = false;
+    if (!s_ble_connected)                         status = "Not connected";
+    else if (!zoom_received)                      status = "Waiting for daemon";
+    else switch (zoom_st.state) {
+        case ZOOM_MEETING:   status = "In meeting"; status_col = COL_GREEN; in_meeting = true; break;
+        case ZOOM_IDLE:      status = "Not in a meeting"; break;
+        case ZOOM_NO_ACCESS: status = "Daemon needs Accessibility"; status_col = COL_AMBER; break;
+        default:             status = "Zoom isn't running"; break;
+    }
+    lv_label_set_text(lbl_zoom_status, status);
+    lv_obj_set_style_text_color(lbl_zoom_status, status_col, 0);
+
+    // Captions state what *is*, not what a tap does: "Unmute" on a muted
+    // tile read as "you're unmuted". Red + a slashed icon also mean "off".
+    lv_label_set_text(lbl_zoom_mic, zoom_st.muted ? "Muted" : "Mic on");
+    lv_label_set_text(lbl_zoom_cam, zoom_st.video ? "Camera on" : "Camera off");
+    lv_obj_set_style_bg_color(zoom_mic_btn, (in_meeting && zoom_st.muted) ? COL_RED : COL_PANEL, 0);
+    lv_obj_set_style_bg_color(zoom_cam_btn, (in_meeting && !zoom_st.video) ? COL_RED : COL_PANEL, 0);
+
+    lv_obj_t* btns[] = {zoom_mic_btn, zoom_cam_btn};
+    for (lv_obj_t* b : btns) {
+        if (in_meeting) lv_obj_remove_state(b, LV_STATE_DISABLED);
+        else            lv_obj_add_state(b, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(b, in_meeting ? LV_OPA_COVER : LV_OPA_40, 0);
+        lv_obj_invalidate(b);
+    }
+}
+
+static void zoom_btn_cb(lv_event_t* e) {
+    if (tap_was_swipe()) return;
+    lv_obj_t* btn = (lv_obj_t*)lv_event_get_current_target(e);
+    if (zoom_st.state != ZOOM_MEETING) return;
+    // Flip right away; the daemon re-reads Zoom's state and confirms.
+    if (btn == zoom_mic_btn) {
+        ble_send_command(CMD_ZOOM_MIC);
+        zoom_st.muted = !zoom_st.muted;
+    } else {
+        ble_send_command(CMD_ZOOM_VIDEO);
+        zoom_st.video = !zoom_st.video;
+    }
+    zoom_refresh();
+}
+
+static lv_obj_t* make_zoom_btn(lv_obj_t* parent, int32_t w, int32_t h, lv_color_t base,
+                               lv_obj_t** caption, const lv_font_t* font) {
+    lv_obj_t* btn = lv_button_create(parent);
+    lv_obj_remove_style_all(btn);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_radius(btn, L.scr_w / 24, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(btn, base, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_lighten(base, LV_OPA_20), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(btn, zoom_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    *caption = lv_label_create(btn);
+    lv_label_set_text(*caption, "");
+    lv_obj_set_style_text_font(*caption, font, 0);
+    lv_obj_set_style_text_color(*caption, COL_TEXT, 0);
+    return btn;
+}
+
+static void init_zoom_screen(lv_obj_t* scr) {
+    zoom_container = lv_obj_create(scr);
+    lv_obj_set_size(zoom_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(zoom_container, 0, 0);
+    lv_obj_set_style_bg_opa(zoom_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(zoom_container, 0, 0);
+    lv_obj_set_style_pad_all(zoom_container, 0, 0);
+    lv_obj_clear_flag(zoom_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(zoom_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* title = lv_label_create(zoom_container);
+    lv_label_set_text(title, "Zoom");
+    lv_obj_set_style_text_font(title, L.title_font, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+
+    const lv_font_t* status_font  = L.bt_credit_1_font;   // 24 / 16 / 12
+    const lv_font_t* caption_font = L.bt_credit_1_font;
+    lbl_zoom_status = lv_label_create(zoom_container);
+    lv_label_set_text(lbl_zoom_status, "");
+    lv_obj_set_width(lbl_zoom_status, L.content_w);
+    lv_label_set_long_mode(lbl_zoom_status, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_align(lbl_zoom_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lbl_zoom_status, status_font, 0);
+    lv_obj_align(lbl_zoom_status, LV_ALIGN_TOP_MID, 0, L.content_y);
+
+    // Mic and camera tiles side by side, leaving a strip below to tap through.
+    const int32_t gap     = L.usage_panel_gap;
+    const int32_t bottom  = L.scr_h * 10 / 100;
+    const int32_t tiles_y = L.content_y + lv_font_get_line_height(status_font) + gap;
+    const int32_t tile_h  = L.scr_h - bottom - tiles_y;
+    const int32_t tile_w  = (L.content_w - gap) / 2;
+
+    zoom_mic_btn = make_zoom_btn(zoom_container, tile_w, tile_h, COL_PANEL, &lbl_zoom_mic, caption_font);
+    lv_obj_set_pos(zoom_mic_btn, L.margin, tiles_y);
+    zoom_cam_btn = make_zoom_btn(zoom_container, tile_w, tile_h, COL_PANEL, &lbl_zoom_cam, caption_font);
+    lv_obj_set_pos(zoom_cam_btn, L.margin + tile_w + gap, tiles_y);
+    for (lv_obj_t* b : {zoom_mic_btn, zoom_cam_btn}) {
+        lv_obj_add_event_cb(b, zoom_icon_draw_cb, LV_EVENT_DRAW_MAIN_END, NULL);
+        lv_obj_align(lv_obj_get_child(b, 0), LV_ALIGN_BOTTOM_MID, 0, -tile_h / 10);
+    }
+
+    zoom_refresh();
+    lv_obj_add_flag(zoom_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -890,6 +1122,8 @@ void ui_init(void) {
     init_codex_screen(scr);
     init_github_screen(scr);
     init_media_screen(scr);
+    init_zoom_screen(scr);
+    lv_obj_add_event_cb(scr, gesture_cb, LV_EVENT_GESTURE, NULL);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -1096,10 +1330,24 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Tapping empty space cycles splash → usage → codex → github → media → splash.
+// Tapping empty space cycles splash → usage → codex → github → media → zoom → splash.
 static void global_click_cb(lv_event_t* e) {
     (void)e;
+    if (tap_was_swipe()) return;
     ui_show_screen((screen_t)((current_screen + 1) % SCREEN_COUNT));
+}
+
+// Swiping anywhere (buttons included) moves through the same cycle:
+// swipe left for the next screen, right for the previous one.
+static void gesture_cb(lv_event_t* e) {
+    (void)e;
+    lv_indev_t* indev = lv_indev_active();
+    if (!indev) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if (dir == LV_DIR_LEFT)
+        ui_show_screen((screen_t)((current_screen + 1) % SCREEN_COUNT));
+    else if (dir == LV_DIR_RIGHT)
+        ui_show_screen((screen_t)((current_screen + SCREEN_COUNT - 1) % SCREEN_COUNT));
 }
 
 void ui_show_screen(screen_t screen) {
@@ -1107,6 +1355,7 @@ void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(github_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(media_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(zoom_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
@@ -1115,6 +1364,7 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_CODEX:   lv_obj_clear_flag(codex_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_GITHUB:  lv_obj_clear_flag(github_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_MEDIA:   lv_obj_clear_flag(media_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_ZOOM:    lv_obj_clear_flag(zoom_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -1145,6 +1395,7 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
     media_refresh_text();
+    zoom_refresh();
     // pair / idle / usage — picked from connection + data freshness.
     update_view_state();
 }
@@ -1242,4 +1493,12 @@ void ui_update_github(const GithubNotifs* gh) {
     }
     if (gh->count > 0) lv_obj_add_flag(lbl_github_empty, LV_OBJ_FLAG_HIDDEN);
     else               lv_obj_clear_flag(lbl_github_empty, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ---- Zoom screen API ----
+
+void ui_update_zoom(const ZoomStatus* zm) {
+    zoom_st = *zm;
+    zoom_received = true;
+    zoom_refresh();
 }

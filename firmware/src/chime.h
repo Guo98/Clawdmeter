@@ -29,5 +29,9 @@ bool chime_init(const ChimeConfig& cfg);
 // or already playing.
 void chime_play(void);
 
+// Queue a short synthesized two-note blip (GitHub review request). Same
+// non-blocking/no-overlap rules as chime_play().
+void chime_play_blip(void);
+
 // Currently a no-op (playback runs in its own task); kept for HAL symmetry.
 void chime_tick(void);
