@@ -14,7 +14,9 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
 ## Screens
 
-The device boots into the splash. Tap the screen anywhere to switch to the Usage view; tap again to flip back to the splash.
+The device boots into the splash. Tap empty space on the screen to cycle splash → Usage → Media → splash.
+
+The **Media** screen has previous / play-pause / next buttons, sent to the host as standard Bluetooth media keys, so they control whatever is playing on the Mac (Spotify desktop, the Spotify web player, Music, YouTube…). On macOS it can also show the current Spotify track, artist, and album art — see [Spotify now playing](#spotify-now-playing-macos).
 
 |              Splash               |              Usage              |
 | :-------------------------------: | :-----------------------------: |
@@ -84,6 +86,22 @@ tail -F ~/Library/Logs/claude-usage-daemon.out.log                          # li
 launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist  # stop
 launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist # start
 ```
+
+### Spotify now playing (macOS)
+
+Optional. The daemon reads your current track from the Spotify Web API, so it works with the web player, the desktop app, or a phone. Spotify requires the developer app's owner to have **Spotify Premium**.
+
+1. At [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard), create an app with redirect URI `http://127.0.0.1:8765/callback` and the **Web API** enabled. Copy its Client ID (the secret isn't needed).
+2. Sign in once (opens your browser):
+
+   ```bash
+   daemon/.venv/bin/python daemon/spotify.py login <client-id>
+   launchctl kickstart -k gui/$(id -u)/com.user.claude-usage-daemon
+   ```
+
+The sign-in is stored in `~/.config/claude-usage-monitor/spotify.json`; delete it to turn the feature off. `daemon/.venv/bin/python daemon/spotify.py now` prints what the daemon sees. Album art needs a PSRAM board (all ESP32-S3 ports); C6 boards show title and artist only. Titles are folded to ASCII because the display fonts are ASCII-only.
+
+> Upgrading firmware from a version without the Media screen changes the board's Bluetooth layout: in System Settings → Bluetooth, **Forget** "Clawdmeter" and connect it again, or macOS keeps a stale copy and the daemon can't connect.
 
 ## Linux installation
 

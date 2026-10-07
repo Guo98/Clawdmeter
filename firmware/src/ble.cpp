@@ -3,6 +3,7 @@
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include <Preferences.h>
+#include <esp_heap_caps.h>
 
 #define DEVICE_NAME "Clawdmeter"
 
@@ -11,6 +12,7 @@
 #define RX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000002"  // host writes here
 #define TX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000003"  // device ack/nack notifies
 #define REQ_CHAR_UUID       "4c41555a-4465-7669-6365-000000000004"  // device-initiated refresh request
+#define ART_CHAR_UUID       "4c41555a-4465-7669-6365-000000000005"  // album art: read = edge px, write = chunks
 
 #define BLE_BUF_SIZE 512
 
@@ -53,14 +55,47 @@ static const uint8_t HID_REPORT_MAP[] = {
     0x29, 0x65,  //   Usage Maximum (101)
     0x81, 0x00,  //   Input (Data, Array) - Key array (6 keys)
     0xC0,        // End Collection
+
+    // Consumer Control (media keys) — one 16-bit usage per report. Drives the
+    // media screen's play/pause and track skip buttons; macOS routes these to
+    // the Now Playing app (e.g. Spotify).
+    0x05, 0x0C,        // Usage Page (Consumer)
+    0x09, 0x01,        // Usage (Consumer Control)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x02,        //   Report ID (2)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x03,  //   Logical Maximum (1023)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x2A, 0xFF, 0x03,  //   Usage Maximum (1023)
+    0x75, 0x10,        //   Report Size (16)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x00,        //   Input (Data, Array, Absolute)
+    0xC0,              // End Collection
 };
 
 static NimBLEServer* server = nullptr;
 static NimBLEHIDDevice* hid_dev = nullptr;
 static NimBLECharacteristic* input_kbd = nullptr;
+static NimBLECharacteristic* input_media = nullptr;
+static volatile bool media_release_pending = false;
+static uint32_t media_release_at_ms = 0;
 static NimBLECharacteristic* tx_char = nullptr;
 static NimBLECharacteristic* rx_char = nullptr;
 static NimBLECharacteristic* req_char = nullptr;
+static NimBLECharacteristic* art_char = nullptr;
+
+// Album art: the daemon streams a square RGB565 (little-endian) image as
+// write-without-response chunks of [id u8][offset u32 LE][pixel bytes]. A new
+// id restarts the transfer, so a cover superseded mid-flight is simply
+// abandoned. Completed images are copied out of the receive buffer by
+// ble_take_art() on the loop task, so LVGL never draws a half-written cover.
+static uint16_t art_px = 0;                 // 0 = art unsupported (no PSRAM)
+static uint32_t art_len = 0;                // art_px * art_px * 2
+static uint8_t* art_rx = nullptr;           // written by the NimBLE host task
+static uint8_t* art_shown = nullptr;        // owned by the loop task / LVGL
+static int      art_rx_id = -1;
+static uint32_t art_rx_bytes = 0;
+static volatile bool art_complete = false;
 
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
@@ -259,30 +294,60 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 };
 
+// Only accept daemon writes over a bonded+encrypted link, and only from the
+// owner machine. Another machine's daemon in range is ignored so the display
+// never rotates to a foreign account. The first encrypted writer claims
+// ownership when none is set yet (e.g. a fresh pairing).
+static bool owner_write_allowed(NimBLEConnInfo& info, const char* what) {
+    std::string id = info.getIdAddress().toString();
+    if (!info.isEncrypted()) {
+        Serial.printf("BLE: dropping %s write from unencrypted link\n", what);
+        return false;
+    }
+    if (!owner_set && id != ZERO_ADDR) {
+        claim_owner(id);
+    }
+    if (owner_set && strcmp(id.c_str(), owner_addr) != 0) {
+        Serial.printf("BLE: dropping %s write from non-owner %s\n", what, id.c_str());
+        return false;
+    }
+    return true;
+}
+
 class RxCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
-        // Only accept usage data over a bonded+encrypted link, and only from the
-        // owner machine. Another machine's daemon in range is ignored so the
-        // display never rotates to a foreign account. The first encrypted writer
-        // claims ownership when none is set yet (e.g. a fresh pairing).
-        std::string id = info.getIdAddress().toString();
-        if (!info.isEncrypted()) {
-            Serial.println("BLE: dropping RX write from unencrypted link");
-            return;
-        }
-        if (!owner_set && id != ZERO_ADDR) {
-            claim_owner(id);
-        }
-        if (owner_set && strcmp(id.c_str(), owner_addr) != 0) {
-            Serial.printf("BLE: dropping RX write from non-owner %s\n", id.c_str());
-            return;
-        }
+        if (!owner_write_allowed(info, "RX")) return;
         std::string val = chr->getValue();
         size_t len = std::min(val.length(), (size_t)(BLE_BUF_SIZE - 1));
         memcpy(rx_buf, val.c_str(), len);
         rx_buf[len] = '\0';
         data_ready = true;
         has_received_data = true;
+    }
+};
+
+class ArtCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
+        if (!art_rx || !owner_write_allowed(info, "art")) return;
+        NimBLEAttValue val = chr->getValue();
+        const uint8_t* p = val.data();
+        size_t len = val.length();
+        if (len < 6) return;
+        int id = p[0];
+        uint32_t off = (uint32_t)p[1] | ((uint32_t)p[2] << 8) |
+                       ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
+        p += 5; len -= 5;
+        if (id != art_rx_id) {   // a new cover: restart the transfer
+            art_rx_id = id;
+            art_rx_bytes = 0;
+        }
+        if (off >= art_len || len > art_len - off) return;
+        memcpy(art_rx + off, p, len);
+        art_rx_bytes += len;
+        if (art_rx_bytes >= art_len) {
+            art_complete = true;
+            art_rx_bytes = 0;    // a resend of the same id starts over
+        }
     }
 };
 
@@ -334,7 +399,8 @@ void ble_init(void) {
     // physical layout is irrelevant; advertise a known one to skip the wizard.
     hid_dev->setHidInfo(33, 0x02);
     hid_dev->setBatteryLevel(100);
-    input_kbd = hid_dev->getInputReport(1);  // report ID 1
+    input_kbd = hid_dev->getInputReport(1);    // report ID 1
+    input_media = hid_dev->getInputReport(2);  // report ID 2 (consumer control)
 
     // --- Custom data service ---
     NimBLEService* svc = server->createService(SERVICE_UUID);
@@ -358,6 +424,16 @@ void ble_init(void) {
     static ReqCallbacks reqCb;
     req_char->setCallbacks(&reqCb);
 
+    art_char = svc->createCharacteristic(
+        ART_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE_NR,
+        BLE_BUF_SIZE
+    );
+    static ArtCallbacks artCb;
+    art_char->setCallbacks(&artCb);
+    uint8_t no_art[2] = {0, 0};   // ble_art_init() sets the real size
+    art_char->setValue(no_art, sizeof(no_art));
+
     svc->start();
     server->start();
     start_advertising();
@@ -379,6 +455,15 @@ void ble_tick(void) {
         if (server && server->getConnectedCount() > 0) {
             Serial.println("BLE: requesting 6s supervision timeout");
             server->updateConnParams(h, 12, 24, 0, DESIRED_TIMEOUT);
+        }
+    }
+    // Deferred media-key release (see ble_media_tap).
+    if (media_release_pending && (int32_t)(millis() - media_release_at_ms) >= 0) {
+        media_release_pending = false;
+        if (state == BLE_STATE_CONNECTED && input_media) {
+            uint8_t report[2] = {0, 0};
+            input_media->setValue(report, sizeof(report));
+            input_media->notify();
         }
     }
 }
@@ -460,4 +545,47 @@ void ble_keyboard_release(void) {
     uint8_t report[8] = {0};
     input_kbd->setValue(report, sizeof(report));
     input_kbd->notify();
+}
+
+void ble_art_init(uint16_t px) {
+#ifdef BOARD_HAS_PSRAM
+    uint32_t len = (uint32_t)px * px * 2;
+    art_rx    = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    art_shown = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (!art_rx || !art_shown) {
+        free(art_rx); free(art_shown);
+        art_rx = art_shown = nullptr;
+        Serial.println("BLE: album art disabled (alloc failed)");
+        return;
+    }
+    art_px = px;
+    art_len = len;
+#else
+    // No PSRAM: two covers would eat ~100 KB of internal SRAM. Advertise
+    // size 0 so the daemon skips sending art.
+    (void)px;
+#endif
+    if (art_char) {
+        uint8_t v[2] = {(uint8_t)(art_px & 0xFF), (uint8_t)(art_px >> 8)};
+        art_char->setValue(v, sizeof(v));
+    }
+}
+
+const uint8_t* ble_take_art(void) {
+    if (!art_complete) return nullptr;
+    art_complete = false;
+    memcpy(art_shown, art_rx, art_len);
+    return art_shown;
+}
+
+// Press a consumer-control usage now and release it from ble_tick() a few
+// connection intervals later, so the host sees a distinct press and release
+// rather than two notifications coalesced into one event.
+void ble_media_tap(uint16_t usage) {
+    if (state != BLE_STATE_CONNECTED || !input_media) return;
+    uint8_t report[2] = {(uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8)};
+    input_media->setValue(report, sizeof(report));
+    input_media->notify();
+    media_release_at_ms = millis() + 60;
+    media_release_pending = true;
 }

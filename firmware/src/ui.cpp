@@ -540,6 +540,201 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
 }
 
+// ---- Media screen: previous / play-pause / next as BLE HID media keys ----
+static lv_obj_t* media_container;
+static lv_obj_t* media_art_box;     // rounded placeholder; clips the cover
+static lv_obj_t* media_art_img;
+static lv_obj_t* lbl_media_title;
+static lv_obj_t* lbl_media_artist;
+static lv_obj_t* media_play_btn;
+static lv_image_dsc_t media_art_dsc;
+static int  media_art_px_val = 0;
+static int  media_state = -1;       // np_state_t, or -1 before the daemon reports
+static NowPlaying media_np = {};
+static bool media_np_received = false;
+
+static void fill_rect(lv_layer_t* layer, int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_color = COL_TEXT;
+    d.bg_opa = LV_OPA_COVER;
+    d.radius = 2;
+    lv_area_t a = {x1, y1, x2, y2};
+    lv_draw_rect(layer, &d, &a);
+}
+
+static void fill_tri(lv_layer_t* layer, int32_t ax, int32_t ay, int32_t bx, int32_t by,
+                     int32_t cx, int32_t cy) {
+    lv_draw_triangle_dsc_t d;
+    lv_draw_triangle_dsc_init(&d);
+    d.color = COL_TEXT;
+    d.opa = LV_OPA_COVER;
+    d.p[0].x = ax; d.p[0].y = ay;
+    d.p[1].x = bx; d.p[1].y = by;
+    d.p[2].x = cx; d.p[2].y = cy;
+    lv_draw_triangle(layer, &d);
+}
+
+// Icons are drawn as shapes rather than font glyphs: the bundled fonts have no
+// media symbols, and an icon font big enough to read across a desk would cost
+// far more flash. Geometry is in units of 1/10 of the button width so the same
+// code scales from the 1.54" panel to the 2.16".
+static void media_icon_draw_cb(lv_event_t* e) {
+    lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+    lv_layer_t* layer = lv_event_get_layer(e);
+    uint16_t usage = (uint16_t)(uintptr_t)lv_event_get_user_data(e);
+    lv_area_t c;
+    lv_obj_get_coords(btn, &c);
+    const int32_t cx = (c.x1 + c.x2) / 2;
+    const int32_t cy = (c.y1 + c.y2) / 2;
+    const int32_t u  = lv_area_get_width(&c) / 10;
+    const int32_t h  = u * 16 / 10;   // icon half-height
+    const int32_t bw = u * 6 / 10;    // bar width
+
+    if (usage == MEDIA_PLAY_PAUSE && media_state == NP_PLAYING) {
+        // ❚❚ — tapping pauses
+        const int32_t gap = u * 6 / 10;
+        fill_rect(layer, cx - gap / 2 - u, cy - h, cx - gap / 2, cy + h);
+        fill_rect(layer, cx + gap / 2, cy - h, cx + gap / 2 + u, cy + h);
+    } else if (usage == MEDIA_PLAY_PAUSE && media_state >= 0) {
+        // ▶ — nudged right so it looks optically centered
+        const int32_t x0 = cx - h * 8 / 10;
+        fill_tri(layer, x0, cy - h, x0, cy + h, x0 + h * 2, cy);
+    } else if (usage == MEDIA_PLAY_PAUSE) {
+        // ▶❚❚ — state unknown (no song info yet), so show both.
+        const int32_t x0 = cx - u * 23 / 10;
+        fill_tri(layer, x0, cy - h, x0, cy + h, x0 + u * 26 / 10, cy);
+        const int32_t b1 = x0 + u * 31 / 10;
+        fill_rect(layer, b1, cy - h, b1 + bw, cy + h);
+        fill_rect(layer, b1 + bw + u * 4 / 10, cy - h, b1 + 2 * bw + u * 4 / 10, cy + h);
+    } else if (usage == MEDIA_NEXT) {
+        // ▶❚
+        fill_tri(layer, cx - h, cy - h, cx - h, cy + h, cx + h - bw, cy);
+        fill_rect(layer, cx + h - bw, cy - h, cx + h, cy + h);
+    } else {
+        // ❚◀
+        fill_rect(layer, cx - h, cy - h, cx - h + bw, cy + h);
+        fill_tri(layer, cx + h, cy - h, cx + h, cy + h, cx - h + bw, cy);
+    }
+}
+
+static void media_btn_cb(lv_event_t* e) {
+    uint16_t usage = (uint16_t)(uintptr_t)lv_event_get_user_data(e);
+    ble_media_tap(usage);
+    // Flip the icon right away; the daemon's next poll (~3 s) confirms it.
+    if (usage == MEDIA_PLAY_PAUSE && media_state >= NP_PAUSED) {
+        media_state = (media_state == NP_PLAYING) ? NP_PAUSED : NP_PLAYING;
+        lv_obj_invalidate(media_play_btn);
+    }
+}
+
+// Title/artist lines, by priority: link down → no info yet → idle → track.
+static void media_refresh_text(void) {
+    if (!lbl_media_title) return;
+    const char* title = "Spotify";
+    const char* artist = "";
+    if (!s_ble_connected)                 title = "Not connected";
+    else if (!media_np_received)          title = "Spotify";
+    else if (media_np.state == NP_OFF)    title = "Nothing playing";
+    else { title = media_np.title; artist = media_np.artist; }
+    // set_text restarts the circular scroll, so only touch changed labels.
+    if (strcmp(lv_label_get_text(lbl_media_title), title) != 0)
+        lv_label_set_text(lbl_media_title, title);
+    if (strcmp(lv_label_get_text(lbl_media_artist), artist) != 0)
+        lv_label_set_text(lbl_media_artist, artist);
+}
+
+static lv_obj_t* make_media_btn(lv_obj_t* parent, int32_t size, uint16_t usage, bool primary) {
+    lv_obj_t* btn = lv_button_create(parent);
+    lv_obj_remove_style_all(btn);   // drop the default theme's shadow/outline
+    lv_obj_set_size(btn, size, size);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_color_t base = primary ? COL_ACCENT : COL_PANEL;
+    lv_obj_set_style_bg_color(btn, base, 0);
+    lv_obj_set_style_bg_color(btn, primary ? lv_color_darken(base, LV_OPA_30)
+                                           : lv_color_lighten(base, LV_OPA_20),
+                              LV_STATE_PRESSED);
+    // No EVENT_BUBBLE: a tap on a button must not also cycle the screen.
+    lv_obj_add_event_cb(btn, media_btn_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)usage);
+    lv_obj_add_event_cb(btn, media_icon_draw_cb, LV_EVENT_DRAW_MAIN_END, (void*)(uintptr_t)usage);
+    return btn;
+}
+
+static void init_media_screen(lv_obj_t* scr) {
+    media_container = lv_obj_create(scr);
+    lv_obj_set_size(media_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(media_container, 0, 0);
+    lv_obj_set_style_bg_opa(media_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(media_container, 0, 0);
+    lv_obj_set_style_pad_all(media_container, 0, 0);
+    lv_obj_clear_flag(media_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(media_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    // Album art at the top, between the corner mascot and the battery.
+    // Multiple of 8 so the daemon's resize stays crisp: 168 / 152 / 80 px.
+    const int32_t art = (L.scr_h * 35 / 100) & ~7;
+    media_art_px_val = art;
+    media_art_box = lv_obj_create(media_container);
+    lv_obj_remove_style_all(media_art_box);
+    lv_obj_set_size(media_art_box, art, art);
+    lv_obj_align(media_art_box, LV_ALIGN_TOP_MID, 0, L.title_y);
+    lv_obj_set_style_bg_color(media_art_box, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(media_art_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(media_art_box, art / 14, 0);
+    lv_obj_set_style_clip_corner(media_art_box, true, 0);
+    lv_obj_add_flag(media_art_box, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    media_art_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    media_art_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    media_art_dsc.header.w = art;
+    media_art_dsc.header.h = art;
+    media_art_dsc.header.stride = art * 2;
+    media_art_dsc.data_size = art * art * 2;
+    media_art_img = lv_image_create(media_art_box);
+    lv_obj_set_pos(media_art_img, 0, 0);
+    lv_obj_add_flag(media_art_img, LV_OBJ_FLAG_HIDDEN);   // until a cover lands
+    lv_obj_add_flag(media_art_img, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    const lv_font_t* title_font  = L.bt_device_font;     // 28 / 20 / 14
+    const lv_font_t* artist_font = L.bt_credit_2_font;   // 20 / 14 / 12
+    const int32_t text_y = L.title_y + art + art / 10;
+
+    lbl_media_title = lv_label_create(media_container);
+    lv_label_set_text(lbl_media_title, "");
+    lv_obj_set_width(lbl_media_title, L.content_w);
+    lv_label_set_long_mode(lbl_media_title, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
+    lv_obj_set_style_text_align(lbl_media_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lbl_media_title, title_font, 0);
+    lv_obj_set_style_text_color(lbl_media_title, COL_TEXT, 0);
+    lv_obj_align(lbl_media_title, LV_ALIGN_TOP_MID, 0, text_y);
+
+    lbl_media_artist = lv_label_create(media_container);
+    lv_label_set_text(lbl_media_artist, "");
+    lv_obj_set_width(lbl_media_artist, L.content_w);
+    lv_label_set_long_mode(lbl_media_artist, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_align(lbl_media_artist, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lbl_media_artist, artist_font, 0);
+    lv_obj_set_style_text_color(lbl_media_artist, COL_DIM, 0);
+    lv_obj_align(lbl_media_artist, LV_ALIGN_TOP_MID, 0,
+                 text_y + lv_font_get_line_height(title_font) + 4);
+
+    // prev · play/pause · next along the bottom; play/pause is the big accent button.
+    const int32_t big   = L.scr_w * 26 / 100;
+    const int32_t small = L.scr_w * 18 / 100;
+    const int32_t gap   = L.scr_w * 5 / 100;
+    const int32_t row_y = -(L.scr_h * 5 / 100);
+    media_play_btn = make_media_btn(media_container, big, MEDIA_PLAY_PAUSE, true);
+    lv_obj_align(media_play_btn, LV_ALIGN_BOTTOM_MID, 0, row_y);
+    lv_obj_t* prev = make_media_btn(media_container, small, MEDIA_PREV, false);
+    lv_obj_align_to(prev, media_play_btn, LV_ALIGN_OUT_LEFT_MID, -gap, 0);
+    lv_obj_t* next = make_media_btn(media_container, small, MEDIA_NEXT, false);
+    lv_obj_align_to(next, media_play_btn, LV_ALIGN_OUT_RIGHT_MID, gap, 0);
+
+    media_refresh_text();
+    lv_obj_add_flag(media_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -557,6 +752,7 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    init_media_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -763,19 +959,21 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
+// Tapping empty space cycles splash → usage → media → splash.
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    ui_show_screen((screen_t)((current_screen + 1) % SCREEN_COUNT));
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(media_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:  splash_show(); break;
     case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_MEDIA:   lv_obj_clear_flag(media_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -805,6 +1003,7 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
     s_ble_connected = (state == BLE_STATE_CONNECTED);
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
+    media_refresh_text();
     // pair / idle / usage — picked from connection + data freshness.
     update_view_state();
 }
@@ -827,4 +1026,30 @@ void ui_update_battery(int percent, bool charging) {
     }
     lv_image_set_src(battery_img, &battery_dscs[idx]);
     apply_battery_visibility();
+}
+
+// ---- Media screen API ----
+
+void ui_update_now_playing(const NowPlaying* np) {
+    media_np = *np;
+    media_np_received = true;
+    if (media_state != np->state) {
+        media_state = np->state;
+        lv_obj_invalidate(media_play_btn);
+    }
+    // Nothing playing → back to the empty placeholder; a new track keeps the
+    // old cover until its own arrives (~1 s later) rather than flashing empty.
+    if (np->state == NP_OFF) lv_obj_add_flag(media_art_img, LV_OBJ_FLAG_HIDDEN);
+    media_refresh_text();
+}
+
+int ui_media_art_px(void) {
+    return media_art_px_val;
+}
+
+void ui_set_media_art(const uint8_t* rgb565) {
+    media_art_dsc.data = rgb565;
+    lv_image_set_src(media_art_img, &media_art_dsc);
+    lv_obj_clear_flag(media_art_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(media_art_img);
 }

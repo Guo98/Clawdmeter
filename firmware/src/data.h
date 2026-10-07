@@ -17,3 +17,16 @@ struct UsageData {
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };
+
+// Now-playing info pushed by the daemon as {"np":{"s":..,"t":..,"a":..}}.
+enum np_state_t {
+    NP_OFF = 0,       // nothing playing / Spotify idle
+    NP_PAUSED = 1,
+    NP_PLAYING = 2,
+};
+
+struct NowPlaying {
+    int  state;              // np_state_t
+    char title[96];
+    char artist[64];
+};

@@ -124,6 +124,9 @@ void ble_keyboard_press(uint8_t key, uint8_t modifier) {
     printf("[sim] HID press key=0x%02X mod=0x%02X\n", key, modifier);
 }
 void ble_keyboard_release(void) { printf("[sim] HID release\n"); }
+void ble_media_tap(uint16_t usage) { printf("[sim] HID media usage=0x%03X\n", usage); }
+void ble_art_init(uint16_t px) { (void)px; }
+const uint8_t* ble_take_art(void) { return nullptr; }
 
 // ---- Playback controls (called from the sim_platform event pump) ----
 void sim_playback_toggle(void) {

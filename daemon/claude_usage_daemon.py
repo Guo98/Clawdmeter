@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -24,13 +25,20 @@ import httpx
 from bleak import BleakClient
 from bleak.exc import BleakError
 
+try:  # run as a script (launchd) vs imported as daemon.* (tests)
+    import spotify
+except ImportError:
+    from daemon import spotify
+
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
+ART_CHAR_UUID = "4c41555a-4465-7669-6365-000000000005"
 
 POLL_INTERVAL = 60
 TICK = 5
+NOW_PLAYING_TICK = 3   # Spotify poll cadence while connected (if signed in)
 CONNECT_TIMEOUT = 20.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -618,6 +626,29 @@ class Session:
         except asyncio.TimeoutError:
             log("Refresh subscription timed out; polling without it")
 
+    async def read_art_px(self) -> int:
+        """Cover size the firmware wants (0 = no art: old firmware or no PSRAM)."""
+        try:
+            raw = await asyncio.wait_for(self.client.read_gatt_char(ART_CHAR_UUID), timeout=10)
+            return int.from_bytes(bytes(raw[:2]), "little")
+        except (BleakError, asyncio.TimeoutError, ValueError) as e:
+            log(f"Album art unsupported by firmware: {e}")
+            return 0
+
+    async def write_art(self, art_id: int, rgb565: bytes) -> bool:
+        """Stream a cover as [id u8][offset u32 LE][bytes] write-without-response chunks."""
+        char = self.client.services.get_characteristic(ART_CHAR_UUID)
+        chunk = max(20, min(char.max_write_without_response_size, 512) - 5)
+        try:
+            for off in range(0, len(rgb565), chunk):
+                header = struct.pack("<BI", art_id & 0xFF, off)
+                await self.client.write_gatt_char(
+                    ART_CHAR_UUID, header + rgb565[off:off + chunk], response=False)
+            return True
+        except BleakError as e:
+            log(f"Art write failed: {e}")
+            return False
+
     async def write_payload(self, payload: dict) -> bool:
         data = json.dumps(payload, separators=(",", ":")).encode()
         log(f"Sending: {data.decode()}")
@@ -714,6 +745,64 @@ def unpair_macos() -> bool:
     return True
 
 
+class MediaRelay:
+    """Mirrors Spotify's now-playing state to the board's media screen.
+
+    Sends {"np": {...}} only when the track/state changes, and the cover only
+    when the artwork URL changes. Never raises: a Spotify outage must not
+    take down the usage display.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self.client: spotify.SpotifyClient | None = None
+        self.art_px = 0
+        self.last_np: dict | None = None
+        self.last_art_url: str | None = None
+        self.art_id = 0
+
+    async def start(self) -> None:
+        try:
+            self.client = spotify.SpotifyClient()
+        except (OSError, ValueError, KeyError) as e:
+            log(f"Spotify sign-in unreadable ({e}); re-run spotify.py login")
+            return
+        self.art_px = await self.session.read_art_px()
+        log(f"Spotify now-playing enabled (art {self.art_px or 'off'}px)")
+
+    async def tick(self) -> None:
+        if not self.client:
+            return
+        try:
+            np = await self.client.now_playing()
+        except (httpx.HTTPError, RuntimeError) as e:
+            log(f"Spotify poll failed: {e}")
+            return
+        if np is None:
+            return
+        msg = {"s": np["s"], "t": np["t"], "a": np["a"]}
+        if msg != self.last_np:
+            if not await self.session.write_payload({"np": msg}):
+                return
+            self.last_np = msg
+        if not self.art_px or np["s"] == spotify.NP_OFF:
+            return
+        url = spotify.pick_art_url(np["art"], self.art_px)
+        if not url or url == self.last_art_url:
+            return
+        try:
+            art = await spotify.fetch_art_rgb565(url, self.art_px)
+        except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError) as e:
+            log(f"Album art fetch failed: {e}")
+            return
+        if art is None:
+            return
+        self.art_id = (self.art_id + 1) & 0xFF
+        if await self.session.write_art(self.art_id, art):
+            self.last_art_url = url
+            log(f"Sent album art ({len(art)} bytes)")
+
+
 async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     """Connect to a target and poll until disconnected or stopped.
 
@@ -750,6 +839,10 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     log("Connected")
     session = Session(client)
     await session.setup_refresh_subscription()
+    media = MediaRelay(session) if spotify.is_configured() else None
+    if media:
+        await media.start()
+    tick = NOW_PLAYING_TICK if media else TICK
 
     last_poll = 0.0
     used_successfully = False
@@ -786,8 +879,11 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                     # cycle) -> stay silent and retry next tick.
                     log("No usable config dir this cycle")
 
+            if media:
+                await media.tick()
+
             try:
-                await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
+                await asyncio.wait_for(session.refresh_requested.wait(), timeout=tick)
             except asyncio.TimeoutError:
                 pass
     finally:

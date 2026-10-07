@@ -22,6 +22,7 @@
 #include "hal/sound_hal.h"
 
 static UsageData usage = {};
+static NowPlaying now_playing = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -98,12 +99,25 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 }
 
 // Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
+enum payload_t { PAYLOAD_BAD, PAYLOAD_USAGE, PAYLOAD_NOW_PLAYING };
+
+// Daemon payloads share the RX characteristic: usage beats are flat objects,
+// now-playing updates arrive wrapped as {"np":{...}} and must not be read as
+// usage (a missing "ok" would flip the usage view to "No data").
+static payload_t parse_json(const char* json, UsageData* out, NowPlaying* np) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
         Serial.printf("JSON parse error: %s\n", err.c_str());
-        return false;
+        return PAYLOAD_BAD;
+    }
+
+    JsonObjectConst npj = doc["np"];
+    if (!npj.isNull()) {
+        np->state = npj["s"] | (int)NP_OFF;
+        strlcpy(np->title, npj["t"] | "", sizeof(np->title));
+        strlcpy(np->artist, npj["a"] | "", sizeof(np->artist));
+        return PAYLOAD_NOW_PLAYING;
     }
 
     out->session_pct = doc["s"] | 0.0f;
@@ -121,7 +135,7 @@ static bool parse_json(const char* json, UsageData* out) {
     out->clock_fmt = doc["tf"] | 24;
     out->ok = doc["ok"] | false;
     out->valid = true;
-    return true;
+    return PAYLOAD_USAGE;
 }
 
 // ---- Serial command buffer ----
@@ -229,6 +243,7 @@ void setup() {
     input_hal_init();
 
     ui_init();
+    ble_art_init(ui_media_art_px());
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
@@ -303,7 +318,7 @@ void loop() {
     // ---- Physical buttons ----
     //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
     //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → on splash: cycle animations; on usage: cycle brightness;
+    //   PWR       → on splash: cycle animations; elsewhere: cycle brightness;
     //               hold ~3s + release: pairing mode
     // First press from sleep is consumed as a wake-only event by
     // idle_consume_wake_press(); the normal action fires from the second
@@ -342,8 +357,8 @@ void loop() {
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // On splash: cycle animations. On the usage view: cycle
-                // screen brightness (single non-splash view, no more screens).
+                // On splash: cycle animations. On the usage and media views:
+                // cycle screen brightness (tapping the panel switches screens).
                 if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
                 else                                          brightness_cycle();
             }
@@ -372,7 +387,11 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
+        payload_t kind = parse_json(ble_get_data(), &usage, &now_playing);
+        if (kind == PAYLOAD_NOW_PLAYING) {
+            ui_update_now_playing(&now_playing);
+            ble_send_ack();
+        } else if (kind == PAYLOAD_USAGE) {
             int g_before = usage_rate_group();
             bool session_reset = usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();
@@ -394,6 +413,7 @@ void loop() {
             ble_send_nack();
         }
     }
+    if (const uint8_t* art = ble_take_art()) ui_set_media_art(art);
 
     delay(5);
 }
